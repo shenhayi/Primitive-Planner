@@ -1,0 +1,42 @@
+<!--
+  Scenario JSON offline visualization launch file
+  ===============================================
+  Option 1: compiled catkin workspace
+    source devel/setup.bash
+    roslaunch primitive_planner viz_scenario.launch \
+      json:=/abs/path/to/scenario_data.json speed:=1.0
+
+  Option 2: run directly with roslaunch
+    source /opt/ros/noetic/setup.bash
+    roslaunch $(rospack find primitive_planner)/launch/viz_scenario.launch \
+      json:=/abs/path/to/scenario_data.json
+
+  Parameters:
+    json       : full path to scenario_data.json (required)
+    speed      : playback speed multiplier, default 1.0
+    loop       : whether to loop playback after finishing, default true
+    trail_len  : drone trail length in points, default 300
+    rviz_config: RViz config path, default scenario_viz.rviz
+-->
+<launch>
+    <arg name="json"      default=""/>
+    <arg name="speed"     default="1.0"/>
+    <arg name="loop"      default="true"/>
+    <arg name="trail_len" default="300"/>
+    <arg name="rviz_config" default="$(find primitive_planner)/launch/vis.rviz"/>
+
+    <!-- RViz with a dedicated config file -->
+    <node name="rviz" pkg="rviz" type="rviz"
+          args="-d $(arg rviz_config)"
+          required="true" output="screen"/>
+
+    <!-- Visualization node: force system Python for ROS package compatibility -->
+    <node name="viz_scenario" pkg="primitive_planner" type="viz_scenario.py"
+          output="screen" required="true"
+          launch-prefix="/usr/bin/python3">
+        <param name="json"      value="$(arg json)"/>
+        <param name="speed"     value="$(arg speed)"/>
+        <param name="loop"      value="$(arg loop)"/>
+        <param name="trail_len" value="$(arg trail_len)"/>
+    </node>
+</launch>

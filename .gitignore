@@ -1,10 +1,7 @@
-.catkin_workspace
 build/
 devel/
-src/CMakeLists.txt
-*.zip
-*.ply
-*.bag
-bags/
-src/planner/plan_manage/primitive_library
-bags_and_logs/
+output/
+src/planner/plan_manage/primitive_library/
+src/scripts/__pycache__/
+paper/
+.catkin_workspace
