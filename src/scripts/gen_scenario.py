@@ -1076,6 +1076,12 @@ def main():
     print(f"\n=== Step 5: Save to {out_json} ===")
 
     output = {
+        "_comment": (
+            "Schema: metadata stores global scenario settings; obstacles is a list of "
+            "cylinders {x, y, radius, height}; drones is a list of {id, start, goal, trajectory}. "
+            "trajectory stores duration, dt, timestamps, positions, velocities, and accelerations "
+            "in world coordinates."
+        ),
         "metadata": {
             "n_drones":     cfg["n_drones"],
             "n_obstacles":  len(obstacles),
