@@ -83,6 +83,7 @@ DEFAULT_CONFIG = {
     # Start/goal parameters
     "safe_margin":      0.5,     # m, minimum clearance from obstacle surfaces
     "traj_margin_extra": 0.05,   # m, extra margin in trajectory collision checks
+    "traj_check_res":   0.05,    # m, max spacing for interpolated collision samples
     "min_sg_dist":      8.0,     # m, minimum distance between one drone's start and goal
     "min_drone_sep":    2.5,     # m, minimum separation between different drones
     "max_place_tries":  2000,    # maximum random placement retries
@@ -158,7 +159,7 @@ class ObstacleEnv:
     def _in_cylinder(self, x: float, y: float, z: float, margin: float) -> bool:
         """Check whether a point lies inside any cylinder with margin."""
         for (cx, cy, r, h) in self.obstacles:
-            if 0 < z < h and math.hypot(x - cx, y - cy) < r + margin:
+            if -margin < z < h + margin and math.hypot(x - cx, y - cy) < r + margin:
                 return True
         return False
 
@@ -182,17 +183,33 @@ class ObstacleEnv:
         """
         cfg = self.cfg
         margin = cfg["drone_radius"] + cfg.get("traj_margin_extra", 0.05)
-        xs, ys, zs = pts_world[:, 0], pts_world[:, 1], pts_world[:, 2]
+        check_res = max(1e-3, float(cfg.get("traj_check_res", 0.05)))
+
+        if len(pts_world) == 0:
+            return True
+
+        dense_pts = [pts_world[0]]
+        for i in range(1, len(pts_world)):
+            p0 = pts_world[i - 1]
+            p1 = pts_world[i]
+            seg_len = float(np.linalg.norm(p1 - p0))
+            n_sub = max(1, int(math.ceil(seg_len / check_res)))
+            for j in range(1, n_sub + 1):
+                s = j / n_sub
+                dense_pts.append(p0 * (1.0 - s) + p1 * s)
+
+        dense_pts = np.asarray(dense_pts, dtype=float)
+        xs, ys, zs = dense_pts[:, 0], dense_pts[:, 1], dense_pts[:, 2]
 
         half_x = cfg["map_x"] / 2
         half_y = cfg["map_y"] / 2
-        if np.any(np.abs(xs) > half_x) or np.any(np.abs(ys) > half_y):
+        if np.any(np.abs(xs) > half_x - margin) or np.any(np.abs(ys) > half_y - margin):
             return False
-        if np.any(zs <= 0) or np.any(zs >= cfg["map_z"]):
+        if np.any(zs <= margin) or np.any(zs >= cfg["map_z"] - margin):
             return False
 
         for (cx, cy, r, h) in self.obstacles:
-            in_z = (zs > 0) & (zs < h)
+            in_z = (zs > -margin) & (zs < h + margin)
             if not np.any(in_z):
                 continue
             d_xy = np.hypot(xs - cx, ys - cy)

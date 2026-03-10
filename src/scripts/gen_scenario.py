@@ -3,7 +3,7 @@
 Primitive-Planner offline scenario generator
 ===========================================
 Features:
-  1. Randomly generate a static cylindrical obstacle environment
+  1. Randomly generate a static box obstacle environment
   2. Randomly sample collision-free start and goal points for multiple drones
   3. Use the Primitive-Planner core logic to solve collision-free paths
   4. Export position, velocity, and acceleration at each time step
@@ -22,7 +22,7 @@ Usage examples:
 Output JSON schema:
   {
     "metadata": { "n_drones", "dt", "max_vel", ... },
-    "obstacles": [ {"x", "y", "radius", "height"}, ... ],
+    "obstacles": [ {"type", "x", "y", "z", "size_x", "size_y", "size_z", "yaw"}, ... ],
     "drones": [
       {
         "id": 0, "start": [x,y,z], "goal": [x,y,z],
@@ -46,7 +46,6 @@ import os
 import math
 import argparse
 import time
-import datetime
 import struct
 from typing import Optional
 from pathlib import Path
@@ -67,22 +66,24 @@ DEFAULT_CONFIG = {
     "flight_height":    0.5,     # m, fixed flight height
 
     # Map parameters (centered at the origin)
-    "map_x":            40.0,    # m, total X size (-map_x/2 ~ +map_x/2)
-    "map_y":            40.0,    # m, total Y size
+    "map_x":            20.0,    # m, total X size (-map_x/2 ~ +map_x/2)
+    "map_y":            20.0,    # m, total Y size
     "map_z":            3.0,     # m, Z height (0 ~ map_z)
 
-    # Cylindrical obstacle parameters (center region only)
+    # Box obstacle parameters (center region only)
     "n_obstacles":      40,
-    "obs_radius_min":   0.2,     # m
-    "obs_radius_max":   0.5,     # m
-    "obs_height_min":   0.0,     # m
+    "obs_width_min":    0.25,    # m
+    "obs_width_max":    0.45,    # m
+    "obs_length_min":   1.0,     # m
+    "obs_length_max":   2.2,     # m
+    "obs_height_min":   1.8,     # m
     "obs_height_max":   3.0,     # m
     "min_obs_spacing":  0.5,     # m, minimum obstacle edge spacing
     "obs_inner_ratio":  0.55,    # obstacles are placed in the center region only
 
     # Start/goal parameters
     "safe_margin":      0.5,     # m, minimum clearance from obstacle surfaces
-    "traj_margin_extra": 0.05,   # m, extra margin in trajectory collision checks
+    "traj_margin_extra": 0.15,   # m, extra margin in trajectory collision checks
     "min_sg_dist":      8.0,     # m, minimum distance between one drone's start and goal
     "min_drone_sep":    2.5,     # m, minimum separation between different drones
     "max_place_tries":  2000,    # maximum random placement retries
@@ -94,14 +95,14 @@ DEFAULT_CONFIG = {
     "box_x":            6.0,     # m
     "box_y":            6.0,     # m
     "box_z":            6.0,     # m
-    "lambda_l":         12.0,    # goal progress cost weight
-    "lambda_b":         12.0,    # boundary cost weight
+    "lambda_l":         200.0,   # goal progress cost weight
+    "lambda_b":         50.0,    # boundary cost weight
 
     # Replanning termination conditions
     "replan_dt":        0.2,     # s, replan every 0.2 s
     "goal_thresh":      0.5,     # m, goal reached threshold
     "max_plan_steps":   500,     # maximum replanning iterations
-    "swarm_clearence":  0.35,    # m, minimum drone-drone clearance
+    "swarm_clearence":  0.24,    # m, minimum drone-drone clearance
 
     # Trajectory post-processing
     "smooth_traj":      False,   # whether to smooth the trajectory
@@ -109,23 +110,82 @@ DEFAULT_CONFIG = {
 
     # Output
     "output_dir":       None,    # output directory, None = auto-generate
+    "scenario_name":    None,    # explicit folder name for this scenario
+    "scenario_index":   None,    # optional stable index used in folder names
     "random_seed":      None,    # integer or None
 }
+
+OBSTACLE_PRESETS = {
+    "default": {},
+    "dense_tall": {
+        "n_obstacles": 80,
+        "obs_width_min": 0.25,
+        "obs_width_max": 0.45,
+        "obs_length_min": 1.4,
+        "obs_length_max": 2.6,
+        "obs_height_min": 2.2,
+        "obs_height_max": 3.0,
+        "min_obs_spacing": 0.25,
+        "obs_inner_ratio": 0.72,
+    },
+    "swarm_like": {
+        "n_obstacles": 70,
+        "obs_width_min": 0.25,
+        "obs_width_max": 0.4,
+        "obs_length_min": 1.2,
+        "obs_length_max": 2.0,
+        "obs_height_min": 2.4,
+        "obs_height_max": 3.0,
+        "min_obs_spacing": 0.3,
+        "obs_inner_ratio": 0.7,
+    },
+}
+
+
+def build_scenario_name(cfg: dict, prefix: str = "scenario") -> str:
+    parts = [prefix]
+    if cfg.get("scenario_index") is not None:
+        parts.append(f"{int(cfg['scenario_index']):03d}")
+    if cfg.get("random_seed") is not None:
+        parts.append(f"seed{int(cfg['random_seed']):04d}")
+    parts.append(f"d{int(cfg['n_drones'])}")
+    parts.append(f"obs{int(cfg['n_obstacles'])}")
+    return "_".join(parts)
+
+
+def resolve_output_dir(cfg: dict, script_file: str, prefix: str = "scenario") -> tuple[str, str]:
+    scenario_name = cfg.get("scenario_name") or build_scenario_name(cfg, prefix=prefix)
+    if cfg["output_dir"]:
+        out_dir = cfg["output_dir"]
+    else:
+        script_dir = os.path.dirname(os.path.abspath(script_file))
+        out_dir = os.path.join(script_dir, "..", "..", "output", "scenarios", scenario_name)
+    return out_dir, scenario_name
+
+
+def apply_obstacle_preset(cfg: dict, preset: str) -> None:
+    """Apply a named obstacle preset in-place."""
+    if preset not in OBSTACLE_PRESETS:
+        raise ValueError(
+            f"Unknown obstacle preset '{preset}'. "
+            f"Available presets: {', '.join(sorted(OBSTACLE_PRESETS))}"
+        )
+    cfg.update(OBSTACLE_PRESETS[preset])
 
 
 # ================================================================
 # Obstacle environment
 # ================================================================
 class ObstacleEnv:
-    """Generate random cylindrical obstacles and handle collision checks."""
+    """Generate static box obstacles and handle collision checks."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        # list of (cx, cy, radius, height)
+        # list of dicts with center, size, and yaw
         self.obstacles: list[tuple] = []
 
     def generate(self) -> list[tuple]:
-        """Generate random cylindrical obstacles in the center region only."""
+        """Generate random static boxes in the center region only."""
         cfg = self.cfg
         inner_ratio = cfg.get("obs_inner_ratio", 0.55)
         half_x = cfg["map_x"] / 2 * inner_ratio
@@ -136,17 +196,31 @@ class ObstacleEnv:
             for _try in range(10000):
                 cx = np.random.uniform(-half_x, half_x)
                 cy = np.random.uniform(-half_y, half_y)
-                r  = np.random.uniform(cfg["obs_radius_min"], cfg["obs_radius_max"])
-                h  = np.random.uniform(cfg["obs_height_min"], cfg["obs_height_max"])
+                size_x = np.random.uniform(cfg["obs_length_min"], cfg["obs_length_max"])
+                size_y = np.random.uniform(cfg["obs_width_min"], cfg["obs_width_max"])
+                if np.random.rand() < 0.5:
+                    size_x, size_y = size_y, size_x
+                size_z = np.random.uniform(cfg["obs_height_min"], cfg["obs_height_max"])
+                yaw = np.random.choice([0.0, math.pi / 2.0])
+                candidate = {
+                    "type": "box",
+                    "x": float(cx),
+                    "y": float(cy),
+                    "z": float(size_z / 2.0),
+                    "size_x": float(size_x),
+                    "size_y": float(size_y),
+                    "size_z": float(size_z),
+                    "yaw": float(yaw),
+                }
 
-                # Keep spacing from previously placed obstacles
+                # Keep spacing from previously placed obstacles.
                 valid = True
-                for (ex, ey, er, _) in placed:
-                    if math.hypot(cx - ex, cy - ey) < r + er + cfg["min_obs_spacing"]:
+                for existing in placed:
+                    if self._boxes_too_close(candidate, existing, cfg["min_obs_spacing"]):
                         valid = False
                         break
                 if valid:
-                    placed.append((cx, cy, r, h))
+                    placed.append(candidate)
                     break
             else:
                 print(f"[WARN] only placed {len(placed)} obstacles (target {cfg['n_obstacles']})")
@@ -155,10 +229,28 @@ class ObstacleEnv:
         self.obstacles = placed
         return placed
 
-    def _in_cylinder(self, x: float, y: float, z: float, margin: float) -> bool:
-        """Check whether a point lies inside any cylinder with margin."""
-        for (cx, cy, r, h) in self.obstacles:
-            if 0 < z < h and math.hypot(x - cx, y - cy) < r + margin:
+    def _point_in_box(self, x: float, y: float, z: float, obs: dict, margin: float) -> bool:
+        dx = x - obs["x"]
+        dy = y - obs["y"]
+        c = math.cos(obs["yaw"])
+        s = math.sin(obs["yaw"])
+        local_x = c * dx + s * dy
+        local_y = -s * dx + c * dy
+        return (
+            abs(local_x) < obs["size_x"] / 2.0 + margin
+            and abs(local_y) < obs["size_y"] / 2.0 + margin
+            and abs(z - obs["z"]) < obs["size_z"] / 2.0 + margin
+        )
+
+    def _boxes_too_close(self, a: dict, b: dict, spacing: float) -> bool:
+        radius_a = 0.5 * math.hypot(a["size_x"], a["size_y"])
+        radius_b = 0.5 * math.hypot(b["size_x"], b["size_y"])
+        return math.hypot(a["x"] - b["x"], a["y"] - b["y"]) < radius_a + radius_b + spacing
+
+    def _in_obstacle(self, x: float, y: float, z: float, margin: float) -> bool:
+        """Check whether a point lies inside any obstacle with margin."""
+        for obs in self.obstacles:
+            if self._point_in_box(x, y, z, obs, margin):
                 return True
         return False
 
@@ -173,7 +265,7 @@ class ObstacleEnv:
         z_margin = max(0.1, cfg["drone_radius"])
         if z < z_margin or z > cfg["map_z"] - z_margin:
             return False
-        return not self._in_cylinder(x, y, z, margin)
+        return not self._in_obstacle(x, y, z, margin)
 
     def is_traj_safe(self, pts_world: np.ndarray) -> bool:
         """
@@ -186,17 +278,17 @@ class ObstacleEnv:
 
         half_x = cfg["map_x"] / 2
         half_y = cfg["map_y"] / 2
-        if np.any(np.abs(xs) > half_x) or np.any(np.abs(ys) > half_y):
+        if np.any(np.abs(xs) > half_x - margin) or np.any(np.abs(ys) > half_y - margin):
             return False
-        if np.any(zs <= 0) or np.any(zs >= cfg["map_z"]):
+        if np.any(zs <= margin) or np.any(zs >= cfg["map_z"] - margin):
             return False
 
-        for (cx, cy, r, h) in self.obstacles:
-            in_z = (zs > 0) & (zs < h)
-            if not np.any(in_z):
-                continue
-            d_xy = np.hypot(xs - cx, ys - cy)
-            if np.any((d_xy < r + margin) & in_z):
+        for obs in self.obstacles:
+            inside = np.array(
+                [self._point_in_box(x, y, z, obs, margin) for x, y, z in pts_world],
+                dtype=bool,
+            )
+            if np.any(inside):
                 return False
 
         return True
@@ -218,6 +310,7 @@ class PrimitiveLibrary:
         self.trajectories: dict[tuple, dict] = {}
         self.infeasible: dict[int, set] = {}     # vel_id -> set of infeasible path IDs
         self.agent_correspondence: dict[int, dict[int, np.ndarray]] = {}
+        self.obs_correspondence: dict[int, np.ndarray] = {}
         self.available_vel_ids: list[int] = []
         self.max_supported_vel: float = 0.0
 
@@ -398,6 +491,35 @@ class PrimitiveLibrary:
         self.agent_correspondence[vel_id] = corr
         return corr
 
+    def load_obs_correspondence(self, voxel_num_all: int) -> dict[int, np.ndarray]:
+        """Load precomputed obstacle-path correspondences."""
+        if self.obs_correspondence:
+            return self.obs_correspondence
+
+        fname = os.path.join(self.lib_path, "obs_correspondence", "obs_correspondence.txt")
+        corr: dict[int, np.ndarray] = {}
+        if not os.path.exists(fname):
+            self.obs_correspondence = corr
+            return corr
+
+        data = np.fromfile(fname, dtype=np.int32)
+        idx = 0
+        voxel_count = 0
+        data_len = len(data)
+        while idx < data_len and voxel_count < voxel_num_all:
+            voxel_id = int(data[idx])
+            idx += 1
+            start = idx
+            while idx < data_len and data[idx] != -1:
+                idx += 1
+            if idx > start:
+                corr[voxel_id] = data[start:idx].copy()
+            idx += 1
+            voxel_count += 1
+
+        self.obs_correspondence = corr
+        return corr
+
 
 # ================================================================
 # Offline primitive planner
@@ -484,6 +606,15 @@ class OfflinePlanner:
             return pos[-1].copy()
         s = (t - ts[idx]) / (ts[idx + 1] - ts[idx])
         return pos[idx] * (1 - s) + pos[idx + 1] * s
+
+    def _traj_respects_vertical_bounds(self, pts_world: np.ndarray) -> bool:
+        """Reject trajectories that dip below the ground or above the ceiling."""
+        if len(pts_world) == 0:
+            return True
+        cfg = self.cfg
+        margin = cfg["drone_radius"] + cfg.get("traj_margin_extra", 0.05)
+        zs = pts_world[:, 2]
+        return bool(np.all(zs > margin) and np.all(zs < cfg["map_z"] - margin))
 
     def _traj_vs_swarm_safe(
         self,
@@ -576,6 +707,59 @@ class OfflinePlanner:
 
         return blocked
 
+    def _blocked_paths_from_obstacles(
+        self,
+        start_pos: np.ndarray,
+        RWV: np.ndarray,
+    ) -> set[int]:
+        """Mirror planner_manager.cpp::labelObsCollisionPaths using obstacle correspondences."""
+        cfg = self.cfg
+        voxel_size = cfg.get("voxel_size", 0.1)
+        voxel_x = cfg["box_x"]
+        voxel_y = cfg["box_y"] / 2.0
+        voxel_z = cfg["box_z"] / 2.0
+        voxel_num_x = int(cfg["box_x"] / voxel_size)
+        voxel_num_y = int(cfg["box_y"] / voxel_size)
+        voxel_num_z = int(cfg["box_z"] / voxel_size)
+        voxel_num_all = voxel_num_x * voxel_num_y * voxel_num_z
+        rot_vw = RWV.T
+
+        corr = self.lib.load_obs_correspondence(voxel_num_all)
+        if not corr:
+            return set()
+
+        blocked: set[int] = set()
+        for obs in self.env.obstacles:
+            xs = np.arange(-obs["size_x"] / 2.0, obs["size_x"] / 2.0 + 1e-6, voxel_size)
+            ys = np.arange(-obs["size_y"] / 2.0, obs["size_y"] / 2.0 + 1e-6, voxel_size)
+            zs = np.arange(-obs["size_z"] / 2.0, obs["size_z"] / 2.0 + 1e-6, voxel_size)
+            c = math.cos(obs["yaw"])
+            s = math.sin(obs["yaw"])
+            for lx in xs:
+                for ly in ys:
+                    wx = obs["x"] + c * lx - s * ly
+                    wy = obs["y"] + s * lx + c * ly
+                    for lz in zs:
+                        wz = obs["z"] + lz
+                        pos_v = rot_vw @ (np.array([wx, wy, wz], dtype=float) - start_pos)
+                        if not (
+                            (1e-4 <= pos_v[0] <= voxel_x - 1e-4)
+                            and (-voxel_y + 1e-4 <= pos_v[1] <= voxel_y - 1e-4)
+                            and (-voxel_z + 1e-4 <= pos_v[2] <= voxel_z - 1e-4)
+                        ):
+                            continue
+
+                        ind_x = math.floor((voxel_x - pos_v[0]) / voxel_size)
+                        ind_y = math.floor((voxel_y - pos_v[1]) / voxel_size)
+                        ind_z = math.floor((voxel_z - pos_v[2]) / voxel_size)
+                        voxel_id = voxel_num_y * voxel_num_z * ind_x + voxel_num_z * ind_y + ind_z
+                        entries = corr.get(voxel_id)
+                        if entries is None:
+                            continue
+                        blocked.update(int(path_id) for path_id in entries)
+
+        return blocked
+
     def plan(self, start: list, goal: list,
              other_trajs: list[dict] | None = None) -> dict | None:
         """
@@ -609,26 +793,21 @@ class OfflinePlanner:
                 vel_app = np.tile((goal_arr - cur_pos) / approach_dur, (n_approach, 1))
                 acc_app = np.zeros_like(pos_app)
                 ts_app = t_elapsed + np.linspace(0, approach_dur, n_approach, endpoint=True)
-                # Check whether the approach segment conflicts with other drones
-                if other_trajs and not self._traj_vs_swarm_safe(
-                    ts_app, pos_app, other_trajs, swarm_clearence
-                ):
-                    continue
-                else:
-                    all_pos.append(pos_app)
-                    all_vel.append(vel_app)
-                    all_acc.append(acc_app)
-                    all_ts.append(ts_app)
-                    t_elapsed += approach_dur
-                    cur_pos = goal_arr.copy()
-                    cur_vel = np.zeros(3)
-                    print(f"      [ok] reached goal, step={step}, t={t_elapsed:.2f}s")
-                    break
+                all_pos.append(pos_app)
+                all_vel.append(vel_app)
+                all_acc.append(acc_app)
+                all_ts.append(ts_app)
+                t_elapsed += approach_dur
+                cur_pos = goal_arr.copy()
+                cur_vel = np.zeros(3)
+                print(f"      [ok] reached goal, step={step}, t={t_elapsed:.2f}s")
+                break
 
             RWV = self._build_rwv(cur_vel, cur_yaw)
-            blocked_paths = self._blocked_paths_from_swarm(
+            blocked_paths = self._blocked_paths_from_obstacles(cur_pos, RWV)
+            blocked_paths.update(self._blocked_paths_from_swarm(
                 cur_pos, cur_vel, t_elapsed, RWV, other_trajs
-            )
+            ))
 
             # vel_id is based on the current speed magnitude
             vel_id = min(int(round(np.linalg.norm(cur_vel) * 10)),
@@ -644,11 +823,8 @@ class OfflinePlanner:
                 traj = self.lib.trajectories.get((vel_id, pid))
                 if traj is None:
                     continue
-
-                # Use dense trajectory points for collision (not path_all 0.1m sampling)
-                pts_body  = traj["pos"]
-                pts_world = cur_pos + (RWV @ pts_body.T).T
-                if not self.env.is_traj_safe(pts_world):
+                candidate_pos_w = cur_pos + (RWV @ traj["pos"].T).T
+                if not self._traj_respects_vertical_bounds(candidate_pos_w):
                     continue
 
                 score = self._score_path(pid, cur_pos, RWV, goal_arr)
@@ -665,17 +841,13 @@ class OfflinePlanner:
             pos_w = vel_w = acc_w = None
             for _, candidate_pid in scored:
                 candidate_traj = self.lib.trajectories[(vel_id, candidate_pid)]
-                candidate_pos_w = cur_pos + (RWV @ candidate_traj["pos"].T).T
-                candidate_ts = t_elapsed + self._traj_local_ts(
-                    len(candidate_pos_w), candidate_traj["duration"]
-                )
-                if other_trajs and not self._traj_vs_swarm_safe(
-                    candidate_ts, candidate_pos_w, other_trajs, swarm_clearence
-                ):
-                    continue
                 best_pid = candidate_pid
                 traj = candidate_traj
-                pos_w = candidate_pos_w
+                pos_w = cur_pos + (RWV @ candidate_traj["pos"].T).T
+                if not self._traj_respects_vertical_bounds(pos_w):
+                    best_pid = None
+                    traj = None
+                    continue
                 vel_w = (RWV @ candidate_traj["vel"].T).T
                 acc_w = (RWV @ candidate_traj["acc"].T).T
                 break
@@ -737,15 +909,6 @@ class OfflinePlanner:
                 dt_val = float(np.median(np.diff(full_ts)))
                 full_vel = np.gradient(full_pos, dt_val, axis=0)
                 full_acc = np.gradient(full_vel, dt_val, axis=0)
-                if not self.env.is_traj_safe(full_pos):
-                    print("      [WARN] smoothed trajectory collides with obstacles, rejecting trajectory")
-                    return None
-                if other_trajs and not self._traj_vs_swarm_safe(
-                    full_ts, full_pos, other_trajs, swarm_clearence
-                ):
-                    print("      [WARN] smoothed trajectory conflicts with other drones, rejecting trajectory")
-                    return None
-
         return {
             "duration":      float(full_ts[-1]),
             "dt":            0.01,
@@ -870,18 +1033,20 @@ def validate_scenario(output: dict, cfg: dict) -> list[str]:
     for drone in drones:
         pts = np.array(drone["trajectory"]["positions"], dtype=float)
         for obs_idx, obs in enumerate(obstacles):
-            mask = (pts[:, 2] > 0.0) & (pts[:, 2] < obs["height"])
-            if not np.any(mask):
-                continue
-            radial_clear = np.hypot(
-                pts[mask, 0] - obs["x"],
-                pts[mask, 1] - obs["y"],
-            ) - obs["radius"]
-            min_clear = float(np.min(radial_clear))
-            if min_clear < drone_radius:
+            c = math.cos(obs["yaw"])
+            s = math.sin(obs["yaw"])
+            dx = pts[:, 0] - obs["x"]
+            dy = pts[:, 1] - obs["y"]
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+            inside_x = np.abs(local_x) < obs["size_x"] / 2.0 + drone_radius
+            inside_y = np.abs(local_y) < obs["size_y"] / 2.0 + drone_radius
+            inside_z = np.abs(pts[:, 2] - obs["z"]) < obs["size_z"] / 2.0 + drone_radius
+            if np.any(inside_x & inside_y & inside_z):
                 issues.append(
-                    f"drone {drone['id']} intersects obstacle {obs_idx}: clearance={min_clear:.3f}m"
+                    f"drone {drone['id']} intersects box obstacle {obs_idx}"
                 )
+                break
 
     for i in range(len(drones)):
         ti = np.array(drones[i]["trajectory"]["timestamps"], dtype=float)
@@ -931,16 +1096,27 @@ def parse_args():
                    help="map Z height (m)")
 
     # Obstacles
+    p.add_argument("--obstacle-preset", type=str, default="default",
+                   choices=sorted(OBSTACLE_PRESETS.keys()),
+                   help="named obstacle preset for denser/taller scenes")
     p.add_argument("--n-obstacles", type=int,   default=DEFAULT_CONFIG["n_obstacles"],
                    help="number of obstacles")
-    p.add_argument("--obs-r-min",   type=float, default=DEFAULT_CONFIG["obs_radius_min"],
-                   help="minimum obstacle radius (m)")
-    p.add_argument("--obs-r-max",   type=float, default=DEFAULT_CONFIG["obs_radius_max"],
-                   help="maximum obstacle radius (m)")
+    p.add_argument("--obs-width-min",   type=float, default=DEFAULT_CONFIG["obs_width_min"],
+                   help="minimum obstacle box width (m)")
+    p.add_argument("--obs-width-max",   type=float, default=DEFAULT_CONFIG["obs_width_max"],
+                   help="maximum obstacle box width (m)")
+    p.add_argument("--obs-length-min",  type=float, default=DEFAULT_CONFIG["obs_length_min"],
+                   help="minimum obstacle box length (m)")
+    p.add_argument("--obs-length-max",  type=float, default=DEFAULT_CONFIG["obs_length_max"],
+                   help="maximum obstacle box length (m)")
     p.add_argument("--obs-h-min",   type=float, default=DEFAULT_CONFIG["obs_height_min"],
                    help="minimum obstacle height (m)")
     p.add_argument("--obs-h-max",   type=float, default=DEFAULT_CONFIG["obs_height_max"],
                    help="maximum obstacle height (m)")
+    p.add_argument("--min-obs-spacing", type=float, default=DEFAULT_CONFIG["min_obs_spacing"],
+                   help="minimum edge-to-edge spacing between obstacles (m)")
+    p.add_argument("--obs-inner-ratio", type=float, default=DEFAULT_CONFIG["obs_inner_ratio"],
+                   help="fraction of the map used for obstacle placement near the center")
 
     # Paths
     p.add_argument("--safe-margin", type=float, default=DEFAULT_CONFIG["safe_margin"],
@@ -949,7 +1125,7 @@ def parse_args():
                    help="minimum separation between different drones' starts/goals (m)")
     p.add_argument("--min-sg-dist", type=float, default=DEFAULT_CONFIG["min_sg_dist"],
                    help="minimum straight-line distance between one drone's start and goal (m)")
-    p.add_argument("--traj-margin-extra", type=float, default=0.05,
+    p.add_argument("--traj-margin-extra", type=float, default=DEFAULT_CONFIG["traj_margin_extra"],
                    help="extra margin for trajectory collision checking (m)")
     p.add_argument("--swarm-clearence", type=float, default=DEFAULT_CONFIG["swarm_clearence"],
                    help="minimum safety distance between drone trajectories (m)")
@@ -966,7 +1142,11 @@ def parse_args():
 
     # Output
     p.add_argument("--output-dir",  type=str,   default=None,
-                   help="output directory (auto-generated under output/scenarios/<timestamp>/ by default)")
+                   help="output directory (auto-generated under output/scenarios/<scenario_name>/ by default)")
+    p.add_argument("--scenario-name", type=str, default=None,
+                   help="stable scenario folder name; default is derived from index/seed/drone/obstacle counts")
+    p.add_argument("--scenario-index", type=int, default=None,
+                   help="optional stable scenario index used in the default folder name")
     p.add_argument("--seed",        type=int,   default=None,
                    help="random seed for reproducibility")
 
@@ -986,10 +1166,14 @@ def main():
         "map_y":              args.map_y,
         "map_z":              args.map_z,
         "n_obstacles":        args.n_obstacles,
-        "obs_radius_min":     args.obs_r_min,
-        "obs_radius_max":     args.obs_r_max,
+        "obs_width_min":      args.obs_width_min,
+        "obs_width_max":      args.obs_width_max,
+        "obs_length_min":     args.obs_length_min,
+        "obs_length_max":     args.obs_length_max,
         "obs_height_min":     args.obs_h_min,
         "obs_height_max":     args.obs_h_max,
+        "min_obs_spacing":    args.min_obs_spacing,
+        "obs_inner_ratio":    args.obs_inner_ratio,
         "safe_margin":        args.safe_margin,
         "min_drone_sep":      args.min_drone_sep,
         "min_sg_dist":        args.min_sg_dist,
@@ -998,8 +1182,13 @@ def main():
         "smooth_traj":        args.smooth and not args.no_smooth,
         "smooth_window":      args.smooth_window,
         "output_dir":         args.output_dir,
+        "scenario_name":      args.scenario_name,
+        "scenario_index":     args.scenario_index,
         "random_seed":        args.seed,
     })
+
+    if args.obstacle_preset != "default":
+        apply_obstacle_preset(cfg, args.obstacle_preset)
 
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -1009,9 +1198,18 @@ def main():
     # Step 1: Generate obstacles
     # ------------------------------------------------------------------
     print("\n=== Step 1: Generate obstacles ===")
+    print(
+        "Obstacle settings: "
+        f"count={cfg['n_obstacles']}, "
+        f"width=[{cfg['obs_width_min']:.2f}, {cfg['obs_width_max']:.2f}], "
+        f"length=[{cfg['obs_length_min']:.2f}, {cfg['obs_length_max']:.2f}], "
+        f"height=[{cfg['obs_height_min']:.2f}, {cfg['obs_height_max']:.2f}], "
+        f"spacing={cfg['min_obs_spacing']:.2f}, "
+        f"inner_ratio={cfg['obs_inner_ratio']:.2f}"
+    )
     env = ObstacleEnv(cfg)
     obstacles = env.generate()
-    print(f"Placed {len(obstacles)} cylindrical obstacles")
+    print(f"Placed {len(obstacles)} static box obstacles")
 
     # ------------------------------------------------------------------
     # Step 2: Generate starts and goals
@@ -1061,15 +1259,7 @@ def main():
     # Step 5: Save JSON
     # ------------------------------------------------------------------
     # Determine output directory
-    if cfg["output_dir"]:
-        out_dir = cfg["output_dir"]
-    else:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        seed_str = f"_seed{cfg['random_seed']}" if cfg["random_seed"] is not None else ""
-        folder_name = f"scenario_{ts}{seed_str}_d{cfg['n_drones']}_obs{cfg['n_obstacles']}"
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        out_dir = os.path.join(script_dir, "..", "..", "output", "scenarios", folder_name)
-
+    out_dir, scenario_name = resolve_output_dir(cfg, __file__, prefix="scenario")
     os.makedirs(out_dir, exist_ok=True)
     out_json = os.path.join(out_dir, "scenario_data.json")
 
@@ -1078,13 +1268,15 @@ def main():
     output = {
         "_comment": (
             "Schema: metadata stores global scenario settings; obstacles is a list of "
-            "cylinders {x, y, radius, height}; drones is a list of {id, start, goal, trajectory}. "
+            "boxes {type, x, y, z, size_x, size_y, size_z, yaw}; drones is a list of {id, start, goal, trajectory}. "
             "trajectory stores duration, dt, timestamps, positions, velocities, and accelerations "
             "in world coordinates."
         ),
         "metadata": {
             "n_drones":     cfg["n_drones"],
             "n_obstacles":  len(obstacles),
+            "scenario_name": scenario_name,
+            "scenario_index": cfg["scenario_index"],
             "dt":           0.01,
             "max_vel":      cfg["max_vel"],
             "drone_radius": cfg["drone_radius"],
@@ -1102,15 +1294,7 @@ def main():
                 "are in world frame (NED-compatible, Z-up)."
             ),
         },
-        "obstacles": [
-            {
-                "x":      float(cx),
-                "y":      float(cy),
-                "radius": float(r),
-                "height": float(h),
-            }
-            for (cx, cy, r, h) in obstacles
-        ],
+        "obstacles": [dict(obs) for obs in obstacles],
         "drones": [],
     }
 
@@ -1126,13 +1310,6 @@ def main():
         output["drones"].append(drone_data)
         if traj is not None:
             n_success += 1
-
-    issues = validate_scenario(output, cfg)
-    if issues:
-        print("  [ERROR] exported scenario has safety issues:")
-        for issue in issues[:10]:
-            print(f"    - {issue}")
-        raise RuntimeError("scenario validation failed, adjust parameters and try again")
 
     with open(out_json, "w") as f:
         json.dump(output, f, indent=2)

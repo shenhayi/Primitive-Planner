@@ -10,7 +10,6 @@ motion, and exports the resulting traces to JSON for Isaac Sim.
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import math
 import os
@@ -23,8 +22,11 @@ from gen_scenario import (
     ObstacleEnv,
     OfflinePlanner,
     PrimitiveLibrary,
+    OBSTACLE_PRESETS,
+    apply_obstacle_preset,
     find_primitive_lib,
     generate_starts_goals,
+    resolve_output_dir,
 )
 
 
@@ -81,48 +83,67 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
             "accelerations": acc_w.tolist(),
         }
 
-    def _approach_proposal(
-        self, cur_pos: np.ndarray, goal: np.ndarray, t_start: float
-    ) -> dict:
-        max_vel = self.cfg["max_vel"]
-        dist = float(np.linalg.norm(cur_pos - goal))
-        dur = max(0.05, dist / max_vel)
-        n_pts = max(2, int(dur * 100))
-        s_vals = np.linspace(0.0, 1.0, n_pts, endpoint=True)
-        pos = np.outer(1 - s_vals, cur_pos) + np.outer(s_vals, goal)
-        vel = np.tile((goal - cur_pos) / dur, (n_pts, 1))
-        acc = np.zeros_like(pos)
-        ts = t_start + np.linspace(0.0, dur, n_pts, endpoint=True)
+    def _trim_to_horizon(self, proposal: dict) -> dict:
+        horizon = min(self.cfg["replan_dt"], float(proposal.get("duration", self.cfg["replan_dt"])))
+        ts = np.array(proposal["timestamps"], dtype=float)
+        pos = np.array(proposal["positions"], dtype=float)
+        vel = np.array(proposal["velocities"], dtype=float)
+        acc = np.array(proposal["accelerations"], dtype=float)
+        t0 = float(ts[0])
+        t_end = t0 + horizon
+
+        mask = ts < t_end - 1e-9
+        if not np.any(mask):
+            mask[0] = True
+
+        ts_trim = ts[mask]
+        pos_trim = pos[mask]
+        vel_trim = vel[mask]
+        acc_trim = acc[mask]
+
+        if t_end > ts_trim[-1] + 1e-9:
+            pos_end = self._interp_pos_at_t(ts, pos, t_end)
+            vel_end = self._interp_pos_at_t(ts, vel, t_end)
+            acc_end = self._interp_pos_at_t(ts, acc, t_end)
+            ts_trim = np.concatenate([ts_trim, np.array([t_end])])
+            pos_trim = np.vstack([pos_trim, pos_end])
+            vel_trim = np.vstack([vel_trim, vel_end])
+            acc_trim = np.vstack([acc_trim, acc_end])
+
         return {
-            "path_id": -1,
-            "duration": float(dur),
-            "timestamps": ts.tolist(),
-            "positions": pos.tolist(),
-            "velocities": vel.tolist(),
-            "accelerations": acc.tolist(),
+            "timestamps": ts_trim,
+            "positions": pos_trim,
+            "velocities": vel_trim,
+            "accelerations": acc_trim,
+            "duration": float(horizon),
         }
 
-    def build_candidates(
+    def _select_best_proposal(
         self,
         state: DroneRuntime,
         t_start: float,
         visible_trajs: list[dict],
-    ) -> list[tuple[float, dict]]:
+        accepted_trajs: list[dict],
+    ) -> dict | None:
         goal = np.array(state.goal, dtype=float)
         dist_to_goal = float(np.linalg.norm(state.pos - goal))
         if dist_to_goal < self.cfg["goal_thresh"]:
-            return [(0.0, self._approach_proposal(state.pos, goal, t_start))]
+            return None
 
         RWV = self._build_rwv(state.vel, state.yaw)
-        blocked = self._blocked_paths_from_swarm(
-            state.pos, state.vel, t_start, RWV, visible_trajs
+        blocked = self._blocked_paths_from_obstacles(state.pos, RWV)
+        blocked.update(
+            self._blocked_paths_from_swarm(state.pos, state.vel, t_start, RWV, visible_trajs)
+        )
+        blocked.update(
+            self._blocked_paths_from_swarm(state.pos, state.vel, t_start, RWV, accepted_trajs)
         )
         vel_id = min(
             int(round(np.linalg.norm(state.vel) * 10)),
             int(round(self.cfg["max_vel"] * 10)),
         )
 
-        scored: list[tuple[float, dict]] = []
+        scored: list[tuple[float, int]] = []
         for pid in range(self.lib.path_count):
             if pid in self.lib.infeasible.get(vel_id, set()):
                 continue
@@ -131,35 +152,28 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
             traj = self.lib.trajectories.get((vel_id, pid))
             if traj is None:
                 continue
-
             pts_world = state.pos + (RWV @ traj["pos"].T).T
-            if not self.env.is_traj_safe(pts_world):
+            if not self._traj_respects_vertical_bounds(pts_world):
                 continue
 
             score = self._score_path(pid, state.pos, RWV, goal)
-            scored.append((score, self._proposal_from_pid(state.pos, RWV, vel_id, pid, t_start)))
+            scored.append((score, pid))
 
         scored.sort(key=lambda item: item[0])
-        return scored
+        exact_visible = visible_trajs + accepted_trajs
+        for _, pid in scored:
+            proposal = self._proposal_from_pid(state.pos, RWV, vel_id, pid, t_start)
+            executed = self._trim_to_horizon(proposal)
+            if not self._traj_vs_swarm_safe(
+                executed["timestamps"],
+                executed["positions"],
+                exact_visible,
+                self.cfg["swarm_clearence"],
+            ):
+                continue
+            return proposal
 
-    def trim_execution(self, proposal: dict) -> dict:
-        replan_dt = self.cfg["replan_dt"]
-        ts = np.array(proposal["timestamps"], dtype=float)
-        pos = np.array(proposal["positions"], dtype=float)
-        vel = np.array(proposal["velocities"], dtype=float)
-        acc = np.array(proposal["accelerations"], dtype=float)
-        t0 = float(ts[0])
-
-        mask = (ts - t0) < replan_dt
-        if not np.any(mask):
-            mask[0] = True
-
-        return {
-            "timestamps": ts[mask],
-            "positions": pos[mask],
-            "velocities": vel[mask],
-            "accelerations": acc[mask],
-        }
+        return None
 
     def simulate(self, starts: list, goals: list) -> list[DroneRuntime]:
         cfg = self.cfg
@@ -180,6 +194,14 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
         global_t = 0.0
         hold_dur = max(cfg["replan_dt"], 0.5)
         for cycle in range(cfg["max_plan_steps"]):
+            for rt in runtimes:
+                if rt.done:
+                    continue
+                if np.linalg.norm(rt.pos - np.array(rt.goal, dtype=float)) < cfg["goal_thresh"]:
+                    rt.done = True
+                    rt.vel = np.zeros(3)
+                    rt.commitment = self._stationary_commitment(rt.pos, global_t, hold_dur)
+
             if all(rt.done for rt in runtimes):
                 break
 
@@ -190,41 +212,23 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
                 elif rt.commitment is not None:
                     visible_prev[rt.drone_id] = rt.commitment
 
-            proposals: dict[int, list[tuple[float, dict]]] = {}
-            for rt in runtimes:
-                if rt.done:
-                    continue
-                visible_trajs = [
-                    traj for did, traj in visible_prev.items() if did != rt.drone_id
-                ]
-                proposals[rt.drone_id] = self.build_candidates(rt, global_t, visible_trajs)
-
             accepted: dict[int, dict] = {}
             accepted_trajs: list[dict] = []
             for rt in runtimes:
                 if rt.done:
                     continue
 
-                chosen = None
-                for _, proposal in proposals.get(rt.drone_id, []):
-                    ts = np.array(proposal["timestamps"], dtype=float)
-                    pos = np.array(proposal["positions"], dtype=float)
-                    if accepted_trajs and not self._traj_vs_swarm_safe(
-                        ts, pos, accepted_trajs, cfg["swarm_clearence"]
-                    ):
-                        continue
-                    chosen = proposal
-                    break
+                visible_trajs = [
+                    traj for did, traj in visible_prev.items() if did != rt.drone_id
+                ]
+                chosen = self._select_best_proposal(rt, global_t, visible_trajs, accepted_trajs)
 
                 if chosen is None:
                     chosen = self._stationary_commitment(rt.pos, global_t, cfg["replan_dt"])
 
                 accepted[rt.drone_id] = chosen
                 accepted_trajs.append(
-                    {
-                        "timestamps": chosen["timestamps"],
-                        "positions": chosen["positions"],
-                    }
+                    self._trim_to_horizon(chosen)
                 )
 
             for rt in runtimes:
@@ -234,7 +238,7 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
 
                 proposal = accepted[rt.drone_id]
                 rt.commitment = proposal
-                executed = self.trim_execution(proposal)
+                executed = self._trim_to_horizon(proposal)
                 rt.pos_log.append(executed["positions"])
                 rt.vel_log.append(executed["velocities"])
                 rt.acc_log.append(executed["accelerations"])
@@ -247,15 +251,35 @@ class DecentralizedOfflinePlanner(OfflinePlanner):
 
                 if np.linalg.norm(rt.pos - np.array(rt.goal, dtype=float)) < cfg["goal_thresh"]:
                     rt.done = True
-                    rt.pos = np.array(rt.goal, dtype=float)
                     rt.vel = np.zeros(3)
-                    rt.commitment = self._stationary_commitment(rt.pos, global_t + cfg["replan_dt"], hold_dur)
+                    rt.commitment = self._stationary_commitment(rt.pos, global_t, hold_dur)
 
-            global_t += cfg["replan_dt"]
+            if accepted_trajs:
+                global_t += min(float(seg["duration"]) for seg in accepted_trajs)
+            else:
+                global_t += cfg["replan_dt"]
         else:
             print(f"[WARN] reached maximum decentralized cycles: {cfg['max_plan_steps']}")
 
         return runtimes
+
+
+def resolve_unique_output_dir(base_dir: str) -> str:
+    """Avoid overwriting an existing scenario_data.json by using a suffixed directory."""
+    out_json = os.path.join(base_dir, "scenario_data.json")
+    if not os.path.exists(out_json):
+        return base_dir
+
+    parent = os.path.dirname(base_dir)
+    name = os.path.basename(base_dir)
+    suffix = 1
+    while True:
+        candidate = os.path.join(parent, f"{name}_dup{suffix:02d}")
+        candidate_json = os.path.join(candidate, "scenario_data.json")
+        if not os.path.exists(candidate_json):
+            print(f"[INFO] output exists, writing to {candidate} instead")
+            return candidate
+        suffix += 1
 
 
 def parse_args():
@@ -270,11 +294,21 @@ def parse_args():
     parser.add_argument("--map-x", type=float, default=DEFAULT_CONFIG["map_x"])
     parser.add_argument("--map-y", type=float, default=DEFAULT_CONFIG["map_y"])
     parser.add_argument("--map-z", type=float, default=DEFAULT_CONFIG["map_z"])
+    parser.add_argument(
+        "--obstacle-preset",
+        type=str,
+        default="default",
+        choices=sorted(OBSTACLE_PRESETS.keys()),
+    )
     parser.add_argument("--n-obstacles", type=int, default=DEFAULT_CONFIG["n_obstacles"])
-    parser.add_argument("--obs-r-min", type=float, default=DEFAULT_CONFIG["obs_radius_min"])
-    parser.add_argument("--obs-r-max", type=float, default=DEFAULT_CONFIG["obs_radius_max"])
+    parser.add_argument("--obs-width-min", type=float, default=DEFAULT_CONFIG["obs_width_min"])
+    parser.add_argument("--obs-width-max", type=float, default=DEFAULT_CONFIG["obs_width_max"])
+    parser.add_argument("--obs-length-min", type=float, default=DEFAULT_CONFIG["obs_length_min"])
+    parser.add_argument("--obs-length-max", type=float, default=DEFAULT_CONFIG["obs_length_max"])
     parser.add_argument("--obs-h-min", type=float, default=DEFAULT_CONFIG["obs_height_min"])
     parser.add_argument("--obs-h-max", type=float, default=DEFAULT_CONFIG["obs_height_max"])
+    parser.add_argument("--min-obs-spacing", type=float, default=DEFAULT_CONFIG["min_obs_spacing"])
+    parser.add_argument("--obs-inner-ratio", type=float, default=DEFAULT_CONFIG["obs_inner_ratio"])
     parser.add_argument("--safe-margin", type=float, default=DEFAULT_CONFIG["safe_margin"])
     parser.add_argument("--min-drone-sep", type=float, default=DEFAULT_CONFIG["min_drone_sep"])
     parser.add_argument("--min-sg-dist", type=float, default=DEFAULT_CONFIG["min_sg_dist"])
@@ -282,6 +316,8 @@ def parse_args():
     parser.add_argument("--swarm-clearence", type=float, default=DEFAULT_CONFIG["swarm_clearence"])
     parser.add_argument("--primitive-lib", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--scenario-name", type=str, default=None)
+    parser.add_argument("--scenario-index", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -300,29 +336,47 @@ def main():
             "map_y": args.map_y,
             "map_z": args.map_z,
             "n_obstacles": args.n_obstacles,
-            "obs_radius_min": args.obs_r_min,
-            "obs_radius_max": args.obs_r_max,
+            "obs_width_min": args.obs_width_min,
+            "obs_width_max": args.obs_width_max,
+            "obs_length_min": args.obs_length_min,
+            "obs_length_max": args.obs_length_max,
             "obs_height_min": args.obs_h_min,
             "obs_height_max": args.obs_h_max,
+            "min_obs_spacing": args.min_obs_spacing,
+            "obs_inner_ratio": args.obs_inner_ratio,
             "safe_margin": args.safe_margin,
             "min_drone_sep": args.min_drone_sep,
             "min_sg_dist": args.min_sg_dist,
             "traj_margin_extra": args.traj_margin_extra,
             "swarm_clearence": args.swarm_clearence,
             "output_dir": args.output_dir,
+            "scenario_name": args.scenario_name,
+            "scenario_index": args.scenario_index,
             "random_seed": args.seed,
             "smooth_traj": False,
         }
     )
+
+    if args.obstacle_preset != "default":
+        apply_obstacle_preset(cfg, args.obstacle_preset)
 
     if args.seed is not None:
         np.random.seed(args.seed)
         print(f"Random seed: {args.seed}")
 
     print("\n=== Step 1: Generate obstacles ===")
+    print(
+        "Obstacle settings: "
+        f"count={cfg['n_obstacles']}, "
+        f"width=[{cfg['obs_width_min']:.2f}, {cfg['obs_width_max']:.2f}], "
+        f"length=[{cfg['obs_length_min']:.2f}, {cfg['obs_length_max']:.2f}], "
+        f"height=[{cfg['obs_height_min']:.2f}, {cfg['obs_height_max']:.2f}], "
+        f"spacing={cfg['min_obs_spacing']:.2f}, "
+        f"inner_ratio={cfg['obs_inner_ratio']:.2f}"
+    )
     env = ObstacleEnv(cfg)
     obstacles = env.generate()
-    print(f"Placed {len(obstacles)} cylindrical obstacles")
+    print(f"Placed {len(obstacles)} static box obstacles")
 
     print("\n=== Step 2: Generate random starts and goals ===")
     starts, goals = generate_starts_goals(env, cfg)
@@ -344,15 +398,9 @@ def main():
     planner = DecentralizedOfflinePlanner(prim_lib, env, cfg)
     runtimes = planner.simulate(starts, goals)
 
-    if cfg["output_dir"]:
-        out_dir = cfg["output_dir"]
-    else:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        seed_str = f"_seed{cfg['random_seed']}" if cfg["random_seed"] is not None else ""
-        folder_name = f"scenario_sync_{ts}{seed_str}_d{cfg['n_drones']}_obs{cfg['n_obstacles']}"
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        out_dir = os.path.join(script_dir, "..", "..", "output", "scenarios", folder_name)
-
+    out_dir, scenario_name = resolve_output_dir(cfg, __file__, prefix="scenario_sync")
+    out_dir = resolve_unique_output_dir(out_dir)
+    scenario_name = os.path.basename(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     out_json = os.path.join(out_dir, "scenario_data.json")
     print(f"\n=== Step 5: Save to {out_json} ===")
@@ -360,7 +408,7 @@ def main():
     output = {
         "_comment": (
             "Schema: metadata stores global scenario settings; obstacles is a list of "
-            "cylinders {x, y, radius, height}; drones is a list of {id, start, goal, trajectory}. "
+            "boxes {type, x, y, z, size_x, size_y, size_z, yaw}; drones is a list of {id, start, goal, trajectory}. "
             "trajectory stores duration, dt, timestamps, positions, velocities, and accelerations "
             "in world coordinates."
         ),
@@ -368,6 +416,8 @@ def main():
             "mode": "decentralized_synchronous_replan",
             "n_drones": cfg["n_drones"],
             "n_obstacles": len(obstacles),
+            "scenario_name": scenario_name,
+            "scenario_index": cfg["scenario_index"],
             "dt": 0.01,
             "replan_dt": cfg["replan_dt"],
             "max_vel": cfg["max_vel"],
@@ -377,10 +427,7 @@ def main():
             "random_seed": cfg["random_seed"],
             "primitive_lib": lib_path,
         },
-        "obstacles": [
-            {"x": float(cx), "y": float(cy), "radius": float(r), "height": float(h)}
-            for (cx, cy, r, h) in obstacles
-        ],
+        "obstacles": [dict(obs) for obs in obstacles],
         "drones": [],
     }
 

@@ -55,5 +55,3 @@ catkin_install_python(PROGRAMS
   ${PROJECT_SOURCE_DIR}/../../scripts/viz_scenario.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
-
-

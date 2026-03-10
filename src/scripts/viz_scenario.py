@@ -3,7 +3,7 @@
 scenario_data.json -> RViz visualization node
 =====================================================
 Published topics:
-  /scenario/obstacles      - MarkerArray  cylindrical obstacles
+  /scenario/obstacles      - MarkerArray  static box obstacles
   /scenario/start_goals    - MarkerArray  start points (green), goals (red), links
   /scenario/traj_full      - MarkerArray  full planned paths (one color per drone)
   /scenario/drone_pos      - MarkerArray  current simulated positions (animated spheres)
@@ -59,25 +59,32 @@ def make_header(frame_id="world") -> Header:
     return h
 
 
+def set_yaw(marker: Marker, yaw: float) -> None:
+    marker.pose.orientation.x = 0.0
+    marker.pose.orientation.y = 0.0
+    marker.pose.orientation.z = math.sin(yaw / 2.0)
+    marker.pose.orientation.w = math.cos(yaw / 2.0)
+
+
 # ------------------------------------------------------------------
 # Static marker builders
 # ------------------------------------------------------------------
 
 def build_obstacle_markers(obstacles: list) -> MarkerArray:
-    """Obstacles as semi-transparent gray cylinders."""
+    """Obstacles as semi-transparent gray boxes."""
     ma = MarkerArray()
     for i, obs in enumerate(obstacles):
         m = Marker()
         m.header = make_header()
         m.ns = "obstacles"
         m.id = i
-        m.type = Marker.CYLINDER
+        m.type = Marker.CUBE
         m.action = Marker.ADD
-        m.pose.position = make_point(obs["x"], obs["y"], obs["height"] / 2.0)
-        m.pose.orientation.w = 1.0
-        m.scale.x = obs["radius"] * 2
-        m.scale.y = obs["radius"] * 2
-        m.scale.z = obs["height"]
+        m.pose.position = make_point(obs["x"], obs["y"], obs["z"])
+        set_yaw(m, obs.get("yaw", 0.0))
+        m.scale.x = obs["size_x"]
+        m.scale.y = obs["size_y"]
+        m.scale.z = obs["size_z"]
         m.color = make_color(0.55, 0.55, 0.55, 0.70)
         m.lifetime = rospy.Duration(0)
         ma.markers.append(m)
