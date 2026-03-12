@@ -301,17 +301,18 @@ def parse_args():
         choices=sorted(OBSTACLE_PRESETS.keys()),
     )
     parser.add_argument("--n-obstacles", type=int, default=DEFAULT_CONFIG["n_obstacles"])
-    parser.add_argument("--obs-width-min", type=float, default=DEFAULT_CONFIG["obs_width_min"])
-    parser.add_argument("--obs-width-max", type=float, default=DEFAULT_CONFIG["obs_width_max"])
-    parser.add_argument("--obs-length-min", type=float, default=DEFAULT_CONFIG["obs_length_min"])
-    parser.add_argument("--obs-length-max", type=float, default=DEFAULT_CONFIG["obs_length_max"])
+    parser.add_argument("--obs-r-min", type=float, default=DEFAULT_CONFIG["obs_radius_min"])
+    parser.add_argument("--obs-r-max", type=float, default=DEFAULT_CONFIG["obs_radius_max"])
     parser.add_argument("--obs-h-min", type=float, default=DEFAULT_CONFIG["obs_height_min"])
     parser.add_argument("--obs-h-max", type=float, default=DEFAULT_CONFIG["obs_height_max"])
     parser.add_argument("--min-obs-spacing", type=float, default=DEFAULT_CONFIG["min_obs_spacing"])
     parser.add_argument("--obs-inner-ratio", type=float, default=DEFAULT_CONFIG["obs_inner_ratio"])
+    parser.add_argument("--voxel-size", type=float, default=DEFAULT_CONFIG["voxel_size"])
     parser.add_argument("--safe-margin", type=float, default=DEFAULT_CONFIG["safe_margin"])
+    parser.add_argument("--start-goal-clearance", type=float, default=DEFAULT_CONFIG["start_goal_clearance"])
     parser.add_argument("--min-drone-sep", type=float, default=DEFAULT_CONFIG["min_drone_sep"])
     parser.add_argument("--min-sg-dist", type=float, default=DEFAULT_CONFIG["min_sg_dist"])
+    parser.add_argument("--periphery-ratio", type=float, default=DEFAULT_CONFIG["periphery_ratio"])
     parser.add_argument("--traj-margin-extra", type=float, default=DEFAULT_CONFIG["traj_margin_extra"])
     parser.add_argument("--swarm-clearence", type=float, default=DEFAULT_CONFIG["swarm_clearence"])
     parser.add_argument("--primitive-lib", type=str, default=None)
@@ -335,18 +336,20 @@ def main():
             "map_x": args.map_x,
             "map_y": args.map_y,
             "map_z": args.map_z,
+            "ground_z": DEFAULT_CONFIG["ground_z"],
             "n_obstacles": args.n_obstacles,
-            "obs_width_min": args.obs_width_min,
-            "obs_width_max": args.obs_width_max,
-            "obs_length_min": args.obs_length_min,
-            "obs_length_max": args.obs_length_max,
+            "obs_radius_min": args.obs_r_min,
+            "obs_radius_max": args.obs_r_max,
             "obs_height_min": args.obs_h_min,
             "obs_height_max": args.obs_h_max,
             "min_obs_spacing": args.min_obs_spacing,
             "obs_inner_ratio": args.obs_inner_ratio,
+            "voxel_size": args.voxel_size,
             "safe_margin": args.safe_margin,
+            "start_goal_clearance": args.start_goal_clearance,
             "min_drone_sep": args.min_drone_sep,
             "min_sg_dist": args.min_sg_dist,
+            "periphery_ratio": args.periphery_ratio,
             "traj_margin_extra": args.traj_margin_extra,
             "swarm_clearence": args.swarm_clearence,
             "output_dir": args.output_dir,
@@ -368,15 +371,20 @@ def main():
     print(
         "Obstacle settings: "
         f"count={cfg['n_obstacles']}, "
-        f"width=[{cfg['obs_width_min']:.2f}, {cfg['obs_width_max']:.2f}], "
-        f"length=[{cfg['obs_length_min']:.2f}, {cfg['obs_length_max']:.2f}], "
+        f"radius=[{cfg['obs_radius_min']:.2f}, {cfg['obs_radius_max']:.2f}], "
         f"height=[{cfg['obs_height_min']:.2f}, {cfg['obs_height_max']:.2f}], "
-        f"spacing={cfg['min_obs_spacing']:.2f}, "
-        f"inner_ratio={cfg['obs_inner_ratio']:.2f}"
+        f"center_spacing={cfg['min_obs_spacing']:.2f}, "
+        f"inner_ratio={cfg['obs_inner_ratio']:.2f}, "
+        f"voxel={cfg['voxel_size']:.2f}"
     )
     env = ObstacleEnv(cfg)
     obstacles = env.generate()
-    print(f"Placed {len(obstacles)} static box obstacles")
+    obstacle_voxel_size = float(cfg["voxel_size"])
+    global_cloud_world = env.export_global_cloud(obstacle_voxel_size)
+    print(
+        f"Placed {len(obstacles)} static cylinder obstacles "
+        f"({len(global_cloud_world)} occupied voxels @ {obstacle_voxel_size:.2f} m)"
+    )
 
     print("\n=== Step 2: Generate random starts and goals ===")
     starts, goals = generate_starts_goals(env, cfg)
@@ -408,7 +416,10 @@ def main():
     output = {
         "_comment": (
             "Schema: metadata stores global scenario settings; obstacles is a list of "
-            "boxes {type, x, y, z, size_x, size_y, size_z, yaw}; drones is a list of {id, start, goal, trajectory}. "
+            "analytic cylinders {type, x, y, z, radius, height, base_z}; "
+            "scenario.global_cloud_world stores voxelized obstacle centers that mimic each cylinder using small cubes "
+            "and match the planner occupancy map; "
+            "drones is a list of {id, start, goal, trajectory}. "
             "trajectory stores duration, dt, timestamps, positions, velocities, and accelerations "
             "in world coordinates."
         ),
@@ -416,6 +427,8 @@ def main():
             "mode": "decentralized_synchronous_replan",
             "n_drones": cfg["n_drones"],
             "n_obstacles": len(obstacles),
+            "global_cloud_points": len(global_cloud_world),
+            "obstacle_voxel_size": obstacle_voxel_size,
             "scenario_name": scenario_name,
             "scenario_index": cfg["scenario_index"],
             "dt": 0.01,
@@ -426,6 +439,9 @@ def main():
             "map_size": {"x": cfg["map_x"], "y": cfg["map_y"], "z": cfg["map_z"]},
             "random_seed": cfg["random_seed"],
             "primitive_lib": lib_path,
+        },
+        "scenario": {
+            "global_cloud_world": global_cloud_world,
         },
         "obstacles": [dict(obs) for obs in obstacles],
         "drones": [],

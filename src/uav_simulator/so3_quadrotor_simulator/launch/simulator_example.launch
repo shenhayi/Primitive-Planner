@@ -59,9 +59,8 @@
   </node>
 
    <node name="rviz" pkg="rviz" type="rviz"
-      args="-d $(find so3_quadrotor_simulator)/config/rviz.rviz"
+      args="-d $(find primitive_planner)/rviz/so3_quadrotor_simulator.rviz"
       />
  </launch>
-
 
 

@@ -19,6 +19,6 @@
   </node>
   <!-- Launch RViz with the demo configuration -->
   <node name="rviz" pkg="rviz" type="rviz"
-        args="-d $(find mockamap)/config/rviz.rviz"
+        args="-d $(find primitive_planner)/rviz/mockamap.rviz"
         />
 </launch>

@@ -3,7 +3,7 @@
 scenario_data.json -> RViz visualization node
 =====================================================
 Published topics:
-  /scenario/obstacles      - MarkerArray  static box obstacles
+  /scenario/obstacles      - MarkerArray  static voxel cloud or box obstacles
   /scenario/start_goals    - MarkerArray  start points (green), goals (red), links
   /scenario/traj_full      - MarkerArray  full planned paths (one color per drone)
   /scenario/drone_pos      - MarkerArray  current simulated positions (animated spheres)
@@ -70,21 +70,50 @@ def set_yaw(marker: Marker, yaw: float) -> None:
 # Static marker builders
 # ------------------------------------------------------------------
 
-def build_obstacle_markers(obstacles: list) -> MarkerArray:
-    """Obstacles as semi-transparent gray boxes."""
+def build_obstacle_markers(obstacles: list, scenario=None, voxel_size: float = 0.1) -> MarkerArray:
+    """Obstacles as a voxel cloud when available, otherwise semi-transparent gray boxes."""
     ma = MarkerArray()
+    scenario = scenario or {}
+    global_cloud_world = scenario.get("global_cloud_world", [])
+
+    if global_cloud_world:
+        m = Marker()
+        m.header = make_header()
+        m.ns = "obstacles"
+        m.id = 0
+        m.type = Marker.CUBE_LIST
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = voxel_size
+        m.scale.y = voxel_size
+        m.scale.z = voxel_size
+        m.color = make_color(0.55, 0.55, 0.55, 0.55)
+        m.points = [make_point(p[0], p[1], p[2]) for p in global_cloud_world]
+        m.lifetime = rospy.Duration(0)
+        ma.markers.append(m)
+        return ma
+
     for i, obs in enumerate(obstacles):
         m = Marker()
         m.header = make_header()
         m.ns = "obstacles"
         m.id = i
-        m.type = Marker.CUBE
+        if obs.get("type") == "cylinder":
+            m.type = Marker.CYLINDER
+        else:
+            m.type = Marker.CUBE
         m.action = Marker.ADD
         m.pose.position = make_point(obs["x"], obs["y"], obs["z"])
-        set_yaw(m, obs.get("yaw", 0.0))
-        m.scale.x = obs["size_x"]
-        m.scale.y = obs["size_y"]
-        m.scale.z = obs["size_z"]
+        if obs.get("type") == "cylinder":
+            m.pose.orientation.w = 1.0
+            m.scale.x = obs["radius"] * 2.0
+            m.scale.y = obs["radius"] * 2.0
+            m.scale.z = obs["height"]
+        else:
+            set_yaw(m, obs.get("yaw", 0.0))
+            m.scale.x = obs["size_x"]
+            m.scale.y = obs["size_y"]
+            m.scale.z = obs["size_z"]
         m.color = make_color(0.55, 0.55, 0.55, 0.70)
         m.lifetime = rospy.Duration(0)
         ma.markers.append(m)
@@ -292,13 +321,17 @@ def main():
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    obstacles = data["obstacles"]
+    obstacles = data.get("obstacles", [])
     drones    = data["drones"]
     meta      = data["metadata"]
+    scenario  = data.get("scenario", {})
     dt        = meta["dt"]  # Trajectory sample step, usually 0.01 s.
     n_drones  = len(drones)
+    voxel_size = float(meta.get("obstacle_voxel_size", 0.1))
+    global_cloud_points = len(scenario.get("global_cloud_world", []))
 
     rospy.loginfo(f"[viz_scenario] {n_drones} drones, {len(obstacles)} obstacles, "
+                  f"{global_cloud_points} obstacle voxels, "
                   f"playback speed {speed}x, {'looping' if loop else 'single pass'}")
 
     # Publishers
@@ -311,7 +344,7 @@ def main():
     rospy.sleep(0.5)  # Wait for RViz subscriptions.
 
     # Publish static scene content once using latched topics.
-    pub_obs.publish(build_obstacle_markers(obstacles))
+    pub_obs.publish(build_obstacle_markers(obstacles, scenario, voxel_size))
     pub_sg.publish(build_start_goal_markers(drones))
     pub_traj.publish(build_traj_full_markers(drones))
     rospy.loginfo("[viz_scenario] Published static scene markers (obstacles, starts/goals, full trajectories)")

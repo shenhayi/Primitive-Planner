@@ -39,7 +39,7 @@ def generate_launch_file(start_num, end_num, total_num, radius, obs_density, out
         file.write('        <param name="min_distance" value="0.8"/>\n')
         file.write('    </node> \n')
         file.write('\n')
-        file.write('    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find primitive_planner)/launch/{}.rviz" required="true" />\n'.format("verbose" if total_num <= 40 else "drone_1000"))
+        file.write('    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find primitive_planner)/rviz/{}.rviz" required="true" />\n'.format("verbose" if total_num <= 40 else "drone_1000"))
         file.write('\n')
     
         step = 2 * np.pi / total_num

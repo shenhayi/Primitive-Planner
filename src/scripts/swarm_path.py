@@ -447,7 +447,7 @@ def timeSpaceCorrespondence(lib_dir, max_vel, max_acc, arc_length, arc_radius, d
 def run(lib_dir, delta_angle=30, plot=False):
     global script_dir
     global max_vel
-    max_vel = 1.0
+    max_vel = 2.0
     max_acc = 6.0
     arc_length = 5.0
     # arc radius set

@@ -1,7 +1,7 @@
 #ifndef _PLANNING_VISUALIZATION_H_
 #define _PLANNING_VISUALIZATION_H_
 
-#include <eigen3/Eigen/Eigen>
+#include <Eigen/Eigen>
 #include <algorithm>
 #include <iostream>
 #include <ros/ros.h>

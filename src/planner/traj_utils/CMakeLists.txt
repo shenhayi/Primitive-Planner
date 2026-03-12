@@ -42,7 +42,7 @@ include_directories(
     SYSTEM 
     include 
     ${catkin_INCLUDE_DIRS}
-    ${Eigen3_INCLUDE_DIRS} 
+    ${EIGEN3_INCLUDE_DIR}
 )
 
 # link_directories(${PCL_LIBRARY_DIRS})

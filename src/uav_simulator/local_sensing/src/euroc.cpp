@@ -18,7 +18,7 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/io/ply_io.h>
 
-#include <eigen3/Eigen/Dense>
+#include <Eigen/Dense>
 #include "opencv2/highgui/highgui.hpp"
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/eigen.hpp>

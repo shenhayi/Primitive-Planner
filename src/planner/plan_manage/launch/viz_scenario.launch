@@ -16,14 +16,14 @@
     speed      : playback speed multiplier, default 1.0
     loop       : whether to loop playback after finishing, default true
     trail_len  : drone trail length in points, default 300
-    rviz_config: RViz config path, default scenario_viz.rviz
+    rviz_config: RViz config path, default vis.rviz
 -->
 <launch>
-    <arg name="json"      default=""/>
+    <arg name="json"      default="/home/haoyus/uav_ws/src/Primitive-Planner/output/scenarios/quick_test/scenario_data.json"/>
     <arg name="speed"     default="1.0"/>
     <arg name="loop"      default="true"/>
     <arg name="trail_len" default="300"/>
-    <arg name="rviz_config" default="$(find primitive_planner)/launch/vis.rviz"/>
+    <arg name="rviz_config" default="$(find primitive_planner)/rviz/vis.rviz"/>
 
     <!-- RViz with a dedicated config file -->
     <node name="rviz" pkg="rviz" type="rviz"

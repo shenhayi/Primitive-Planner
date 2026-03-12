@@ -3,7 +3,7 @@
 Primitive-Planner offline scenario generator
 ===========================================
 Features:
-  1. Randomly generate a static box obstacle environment
+  1. Randomly generate a static cylinder obstacle environment
   2. Randomly sample collision-free start and goal points for multiple drones
   3. Use the Primitive-Planner core logic to solve collision-free paths
   4. Export position, velocity, and acceleration at each time step
@@ -22,7 +22,7 @@ Usage examples:
 Output JSON schema:
   {
     "metadata": { "n_drones", "dt", "max_vel", ... },
-    "obstacles": [ {"type", "x", "y", "z", "size_x", "size_y", "size_z", "yaw"}, ... ],
+    "obstacles": [ {"type", "x", "y", "z", "radius", "height", "base_z"}, ... ],
     "drones": [
       {
         "id": 0, "start": [x,y,z], "goal": [x,y,z],
@@ -66,20 +66,20 @@ DEFAULT_CONFIG = {
     "flight_height":    0.5,     # m, fixed flight height
 
     # Map parameters (centered at the origin)
-    "map_x":            20.0,    # m, total X size (-map_x/2 ~ +map_x/2)
-    "map_y":            20.0,    # m, total Y size
-    "map_z":            3.0,     # m, Z height (0 ~ map_z)
+    "map_x":            30.0,    # m, total X size (-map_x/2 ~ +map_x/2)
+    "map_y":            30.0,    # m, total Y size
+    "map_z":            10.0,    # m, Z height (0 ~ map_z)
+    "ground_z":         0.0,     # m
 
-    # Box obstacle parameters (center region only)
+    # Cylinder obstacle parameters (center region only), matching primitive_planner_data_gen
     "n_obstacles":      40,
-    "obs_width_min":    0.25,    # m
-    "obs_width_max":    0.45,    # m
-    "obs_length_min":   1.0,     # m
-    "obs_length_max":   2.2,     # m
-    "obs_height_min":   1.8,     # m
-    "obs_height_max":   3.0,     # m
-    "min_obs_spacing":  0.5,     # m, minimum obstacle edge spacing
-    "obs_inner_ratio":  0.55,    # obstacles are placed in the center region only
+    "obs_radius_min":   0.4,     # m
+    "obs_radius_max":   0.8,     # m
+    "obs_height_min":   2.0,     # m
+    "obs_height_max":   10.0,    # m
+    "min_obs_spacing":  2.0,     # m, minimum cylinder-center spacing
+    "obs_inner_ratio":  0.60,    # obstacles are placed in the center region only
+    "voxel_size":       0.1,     # m, occupied voxel size for obstacle export/correspondence
 
     # Start/goal parameters
     "safe_margin":      0.5,     # m, minimum clearance from obstacle surfaces
@@ -87,6 +87,8 @@ DEFAULT_CONFIG = {
     "min_sg_dist":      8.0,     # m, minimum distance between one drone's start and goal
     "min_drone_sep":    2.5,     # m, minimum separation between different drones
     "max_place_tries":  2000,    # maximum random placement retries
+    "start_goal_clearance": 1.0, # m, minimum clearance from obstacle voxels for starts/goals
+    "periphery_ratio":  0.9,     # outer ring ratio, matching primitive_planner_data_gen
 
     # Primitive library path (None = auto-detect)
     "primitive_lib_path": None,
@@ -119,25 +121,21 @@ OBSTACLE_PRESETS = {
     "default": {},
     "dense_tall": {
         "n_obstacles": 80,
-        "obs_width_min": 0.25,
-        "obs_width_max": 0.45,
-        "obs_length_min": 1.4,
-        "obs_length_max": 2.6,
-        "obs_height_min": 2.2,
-        "obs_height_max": 3.0,
-        "min_obs_spacing": 0.25,
+        "obs_radius_min": 0.45,
+        "obs_radius_max": 0.90,
+        "obs_height_min": 4.0,
+        "obs_height_max": 10.0,
+        "min_obs_spacing": 1.6,
         "obs_inner_ratio": 0.72,
     },
     "swarm_like": {
         "n_obstacles": 70,
-        "obs_width_min": 0.25,
-        "obs_width_max": 0.4,
-        "obs_length_min": 1.2,
-        "obs_length_max": 2.0,
-        "obs_height_min": 2.4,
-        "obs_height_max": 3.0,
-        "min_obs_spacing": 0.3,
-        "obs_inner_ratio": 0.7,
+        "obs_radius_min": 0.4,
+        "obs_radius_max": 0.8,
+        "obs_height_min": 2.0,
+        "obs_height_max": 10.0,
+        "min_obs_spacing": 2.0,
+        "obs_inner_ratio": 0.60,
     },
 }
 
@@ -177,46 +175,51 @@ def apply_obstacle_preset(cfg: dict, preset: str) -> None:
 # Obstacle environment
 # ================================================================
 class ObstacleEnv:
-    """Generate static box obstacles and handle collision checks."""
+    """Generate static cylinder obstacles and handle collision checks."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        # list of dicts with center, size, and yaw
-        self.obstacles: list[tuple] = []
+        # list of dicts with center, radius, height, and base_z
+        self.obstacles: list[dict] = []
+        self._voxel_cloud_cache: dict[float, np.ndarray] = {}
+        self._centers_xy = np.empty((0, 2), dtype=float)
+        self._radii = np.empty((0,), dtype=float)
+        self._heights = np.empty((0,), dtype=float)
+        self._base_z = np.empty((0,), dtype=float)
 
-    def generate(self) -> list[tuple]:
-        """Generate random static boxes in the center region only."""
+    def generate(self) -> list[dict]:
+        """Generate random static cylinders in the center region only."""
         cfg = self.cfg
-        inner_ratio = cfg.get("obs_inner_ratio", 0.55)
+        inner_ratio = cfg.get("obs_inner_ratio", 0.60)
         half_x = cfg["map_x"] / 2 * inner_ratio
         half_y = cfg["map_y"] / 2 * inner_ratio
-        placed: list[tuple] = []
+        placed: list[dict] = []
+        ground_z = float(cfg.get("ground_z", 0.0))
+        height_max = min(float(cfg["obs_height_max"]), float(cfg["map_z"]) - ground_z)
+        if height_max <= 0.0:
+            raise ValueError("map_z must be greater than ground_z to place cylinder obstacles")
+        height_min = min(float(cfg["obs_height_min"]), height_max)
 
         for _ in range(cfg["n_obstacles"]):
             for _try in range(10000):
                 cx = np.random.uniform(-half_x, half_x)
                 cy = np.random.uniform(-half_y, half_y)
-                size_x = np.random.uniform(cfg["obs_length_min"], cfg["obs_length_max"])
-                size_y = np.random.uniform(cfg["obs_width_min"], cfg["obs_width_max"])
-                if np.random.rand() < 0.5:
-                    size_x, size_y = size_y, size_x
-                size_z = np.random.uniform(cfg["obs_height_min"], cfg["obs_height_max"])
-                yaw = np.random.choice([0.0, math.pi / 2.0])
+                radius = np.random.uniform(cfg["obs_radius_min"], cfg["obs_radius_max"])
+                height = np.random.uniform(height_min, height_max)
                 candidate = {
-                    "type": "box",
+                    "type": "cylinder",
                     "x": float(cx),
                     "y": float(cy),
-                    "z": float(size_z / 2.0),
-                    "size_x": float(size_x),
-                    "size_y": float(size_y),
-                    "size_z": float(size_z),
-                    "yaw": float(yaw),
+                    "z": float(ground_z + height / 2.0),
+                    "base_z": ground_z,
+                    "radius": float(radius),
+                    "height": float(height),
                 }
 
-                # Keep spacing from previously placed obstacles.
+                # Match the C++ data generator: spacing is enforced between obstacle centers.
                 valid = True
                 for existing in placed:
-                    if self._boxes_too_close(candidate, existing, cfg["min_obs_spacing"]):
+                    if self._cylinders_too_close(candidate, existing, cfg["min_obs_spacing"]):
                         valid = False
                         break
                 if valid:
@@ -227,45 +230,99 @@ class ObstacleEnv:
                 break
 
         self.obstacles = placed
+        self._voxel_cloud_cache.clear()
+        self._refresh_obstacle_arrays()
         return placed
 
-    def _point_in_box(self, x: float, y: float, z: float, obs: dict, margin: float) -> bool:
-        dx = x - obs["x"]
-        dy = y - obs["y"]
-        c = math.cos(obs["yaw"])
-        s = math.sin(obs["yaw"])
-        local_x = c * dx + s * dy
-        local_y = -s * dx + c * dy
-        return (
-            abs(local_x) < obs["size_x"] / 2.0 + margin
-            and abs(local_y) < obs["size_y"] / 2.0 + margin
-            and abs(z - obs["z"]) < obs["size_z"] / 2.0 + margin
+    def _refresh_obstacle_arrays(self) -> None:
+        if not self.obstacles:
+            self._centers_xy = np.empty((0, 2), dtype=float)
+            self._radii = np.empty((0,), dtype=float)
+            self._heights = np.empty((0,), dtype=float)
+            self._base_z = np.empty((0,), dtype=float)
+            return
+
+        self._centers_xy = np.array(
+            [[obs["x"], obs["y"]] for obs in self.obstacles],
+            dtype=float,
         )
+        self._radii = np.array([obs["radius"] for obs in self.obstacles], dtype=float)
+        self._heights = np.array([obs["height"] for obs in self.obstacles], dtype=float)
+        self._base_z = np.array([obs.get("base_z", obs["z"] - obs["height"] / 2.0) for obs in self.obstacles], dtype=float)
 
-    def _boxes_too_close(self, a: dict, b: dict, spacing: float) -> bool:
-        radius_a = 0.5 * math.hypot(a["size_x"], a["size_y"])
-        radius_b = 0.5 * math.hypot(b["size_x"], b["size_y"])
-        return math.hypot(a["x"] - b["x"], a["y"] - b["y"]) < radius_a + radius_b + spacing
+    def _cylinders_too_close(self, a: dict, b: dict, spacing: float) -> bool:
+        return math.hypot(a["x"] - b["x"], a["y"] - b["y"]) < spacing
 
-    def _in_obstacle(self, x: float, y: float, z: float, margin: float) -> bool:
-        """Check whether a point lies inside any obstacle with margin."""
-        for obs in self.obstacles:
-            if self._point_in_box(x, y, z, obs, margin):
-                return True
-        return False
+    def _voxelize_cylinder(self, obs: dict, voxel_size: float) -> np.ndarray:
+        radius = float(obs["radius"])
+        height = float(obs["height"])
+        base_z = float(obs.get("base_z", obs["z"] - height / 2.0))
 
-    def is_point_safe(self, x: float, y: float, z: float) -> bool:
+        cells_xy = max(1, int(math.ceil((2.0 * radius) / voxel_size)))
+        cells_z = max(1, int(math.ceil(height / voxel_size)))
+        xy_offsets = np.arange(-cells_xy // 2, cells_xy // 2 + 1, dtype=float) * voxel_size
+        grid_x, grid_y = np.meshgrid(xy_offsets, xy_offsets, indexing="ij")
+        mask = grid_x * grid_x + grid_y * grid_y <= radius * radius + 1e-9
+        xy = np.column_stack([grid_x[mask], grid_y[mask]])
+        if xy.size == 0:
+            xy = np.zeros((1, 2), dtype=float)
+
+        z_vals = base_z + (np.arange(cells_z, dtype=float) + 0.5) * voxel_size
+        pts = np.empty((xy.shape[0] * cells_z, 3), dtype=float)
+        pts[:, 0] = obs["x"] + np.repeat(xy[:, 0], cells_z)
+        pts[:, 1] = obs["y"] + np.repeat(xy[:, 1], cells_z)
+        pts[:, 2] = np.tile(z_vals, xy.shape[0])
+        return pts
+
+    def voxel_cloud(self, voxel_size: float | None = None) -> np.ndarray:
+        voxel_size = max(1e-3, float(voxel_size or self.cfg.get("voxel_size", 0.1)))
+        cache_key = round(voxel_size, 6)
+        cached = self._voxel_cloud_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if not self.obstacles:
+            cloud = np.empty((0, 3), dtype=float)
+        else:
+            clouds = [self._voxelize_cylinder(obs, voxel_size) for obs in self.obstacles]
+            cloud = np.vstack(clouds) if clouds else np.empty((0, 3), dtype=float)
+
+        self._voxel_cloud_cache[cache_key] = cloud
+        return cloud
+
+    def export_global_cloud(self, voxel_size: float | None = None) -> list[list[float]]:
+        return self.voxel_cloud(voxel_size).tolist()
+
+    def _points_in_obstacles(self, pts_world: np.ndarray, margin: float) -> np.ndarray:
+        if len(pts_world) == 0 or len(self.obstacles) == 0:
+            return np.zeros((len(pts_world),), dtype=bool)
+
+        dx = pts_world[:, None, 0] - self._centers_xy[None, :, 0]
+        dy = pts_world[:, None, 1] - self._centers_xy[None, :, 1]
+        inside_xy = dx * dx + dy * dy < np.square(self._radii[None, :] + margin)
+        inside_z = (
+            (pts_world[:, None, 2] > self._base_z[None, :] - margin)
+            & (pts_world[:, None, 2] < self._base_z[None, :] + self._heights[None, :] + margin)
+        )
+        return np.any(inside_xy & inside_z, axis=1)
+
+    def is_point_safe(self, x: float, y: float, z: float, clearance: float | None = None) -> bool:
         """Check whether a single point is safe and inside the map."""
         cfg = self.cfg
-        margin = cfg["drone_radius"] + cfg["safe_margin"]
+        margin = (
+            float(clearance)
+            if clearance is not None
+            else cfg["drone_radius"] + cfg["safe_margin"]
+        )
         half_x = cfg["map_x"] / 2
         half_y = cfg["map_y"] / 2
         if abs(x) > half_x - margin or abs(y) > half_y - margin:
             return False
         z_margin = max(0.1, cfg["drone_radius"])
-        if z < z_margin or z > cfg["map_z"] - z_margin:
+        ground_z = cfg.get("ground_z", 0.0)
+        if z < ground_z + z_margin or z > cfg["map_z"] - z_margin:
             return False
-        return not self._in_obstacle(x, y, z, margin)
+        return not bool(self._points_in_obstacles(np.array([[x, y, z]], dtype=float), margin)[0])
 
     def is_traj_safe(self, pts_world: np.ndarray) -> bool:
         """
@@ -280,18 +337,11 @@ class ObstacleEnv:
         half_y = cfg["map_y"] / 2
         if np.any(np.abs(xs) > half_x - margin) or np.any(np.abs(ys) > half_y - margin):
             return False
-        if np.any(zs <= margin) or np.any(zs >= cfg["map_z"] - margin):
+        ground_z = cfg.get("ground_z", 0.0)
+        if np.any(zs <= ground_z + margin) or np.any(zs >= cfg["map_z"] - margin):
             return False
 
-        for obs in self.obstacles:
-            inside = np.array(
-                [self._point_in_box(x, y, z, obs, margin) for x, y, z in pts_world],
-                dtype=bool,
-            )
-            if np.any(inside):
-                return False
-
-        return True
+        return not np.any(self._points_in_obstacles(pts_world, margin))
 
 
 # ================================================================
@@ -728,35 +778,34 @@ class OfflinePlanner:
         if not corr:
             return set()
 
-        blocked: set[int] = set()
-        for obs in self.env.obstacles:
-            xs = np.arange(-obs["size_x"] / 2.0, obs["size_x"] / 2.0 + 1e-6, voxel_size)
-            ys = np.arange(-obs["size_y"] / 2.0, obs["size_y"] / 2.0 + 1e-6, voxel_size)
-            zs = np.arange(-obs["size_z"] / 2.0, obs["size_z"] / 2.0 + 1e-6, voxel_size)
-            c = math.cos(obs["yaw"])
-            s = math.sin(obs["yaw"])
-            for lx in xs:
-                for ly in ys:
-                    wx = obs["x"] + c * lx - s * ly
-                    wy = obs["y"] + s * lx + c * ly
-                    for lz in zs:
-                        wz = obs["z"] + lz
-                        pos_v = rot_vw @ (np.array([wx, wy, wz], dtype=float) - start_pos)
-                        if not (
-                            (1e-4 <= pos_v[0] <= voxel_x - 1e-4)
-                            and (-voxel_y + 1e-4 <= pos_v[1] <= voxel_y - 1e-4)
-                            and (-voxel_z + 1e-4 <= pos_v[2] <= voxel_z - 1e-4)
-                        ):
-                            continue
+        cloud_world = self.env.voxel_cloud(voxel_size)
+        if len(cloud_world) == 0:
+            return set()
 
-                        ind_x = math.floor((voxel_x - pos_v[0]) / voxel_size)
-                        ind_y = math.floor((voxel_y - pos_v[1]) / voxel_size)
-                        ind_z = math.floor((voxel_z - pos_v[2]) / voxel_size)
-                        voxel_id = voxel_num_y * voxel_num_z * ind_x + voxel_num_z * ind_y + ind_z
-                        entries = corr.get(voxel_id)
-                        if entries is None:
-                            continue
-                        blocked.update(int(path_id) for path_id in entries)
+        pos_v = (cloud_world - start_pos) @ rot_vw.T
+        inside = (
+            (pos_v[:, 0] >= 1e-4)
+            & (pos_v[:, 0] <= voxel_x - 1e-4)
+            & (pos_v[:, 1] >= -voxel_y + 1e-4)
+            & (pos_v[:, 1] <= voxel_y - 1e-4)
+            & (pos_v[:, 2] >= -voxel_z + 1e-4)
+            & (pos_v[:, 2] <= voxel_z - 1e-4)
+        )
+        if not np.any(inside):
+            return set()
+
+        pos_v = pos_v[inside]
+        ind_x = np.floor((voxel_x - pos_v[:, 0]) / voxel_size).astype(int)
+        ind_y = np.floor((voxel_y - pos_v[:, 1]) / voxel_size).astype(int)
+        ind_z = np.floor((voxel_z - pos_v[:, 2]) / voxel_size).astype(int)
+        voxel_ids = np.unique(voxel_num_y * voxel_num_z * ind_x + voxel_num_z * ind_y + ind_z)
+
+        blocked: set[int] = set()
+        for voxel_id in voxel_ids:
+            entries = corr.get(int(voxel_id))
+            if entries is None:
+                continue
+            blocked.update(int(path_id) for path_id in entries)
 
         return blocked
 
@@ -944,18 +993,25 @@ def generate_starts_goals(env: ObstacleEnv,
     Place starts and goals on the outer ring, outside the obstacle region,
     with collision-free spacing between drones.
     """
-    z = cfg["flight_height"]
+    ground_z = float(cfg.get("ground_z", 0.0))
+    z = max(float(cfg["flight_height"]), ground_z + 0.2)
     map_radius = min(cfg["map_x"], cfg["map_y"]) / 2
-    # Outer radius: stay outside the obstacle region with safety margin
-    inner_ratio = cfg.get("obs_inner_ratio", 0.55)
-    periphery_radius = map_radius * (inner_ratio + 0.35)  # 0.55+0.35=0.9, outside obstacle region
-    periphery_radius = min(periphery_radius, map_radius * 0.92)
+    inner_ratio = cfg.get("obs_inner_ratio", 0.60)
+    periphery_ratio = cfg.get("periphery_ratio", 0.9)
+    periphery_radius = min(
+        max(map_radius * periphery_ratio, map_radius * (inner_ratio + 0.35)),
+        map_radius * 0.92,
+    )
 
     n = cfg["n_drones"]
     starts, goals = [], []
     max_tries = cfg.get("max_place_tries", 2000)
     min_sep = cfg["min_drone_sep"]
     min_sg_dist = cfg["min_sg_dist"]
+    obstacle_clearance = max(
+        cfg["drone_radius"] + cfg["safe_margin"],
+        float(cfg.get("start_goal_clearance", 1.0)),
+    )
 
     chord = 2.0 * periphery_radius * math.sin(math.pi / max(n, 1))
     if n > 1 and chord < min_sep:
@@ -964,20 +1020,24 @@ def generate_starts_goals(env: ObstacleEnv,
         )
 
     chosen_angles: list[float] = []
-    for _ in range(max_tries):
-        angles = np.sort(np.random.uniform(0.0, 2.0 * np.pi, n))
-        valid = True
-        for i in range(n):
-            delta = (angles[(i + 1) % n] - angles[i]) % (2.0 * np.pi)
-            sep = 2.0 * periphery_radius * math.sin(delta / 2.0)
-            if sep < min_sep:
-                valid = False
+    if n == 1:
+        chosen_angles = [float(np.random.uniform(0.0, 2.0 * np.pi))]
+
+    if n > 1:
+        for _ in range(max_tries):
+            angles = np.sort(np.random.uniform(0.0, 2.0 * np.pi, n))
+            valid = True
+            for i in range(n):
+                delta = (angles[(i + 1) % n] - angles[i]) % (2.0 * np.pi)
+                sep = 2.0 * periphery_radius * math.sin(delta / 2.0)
+                if sep < min_sep:
+                    valid = False
+                    break
+            if valid:
+                chosen_angles = angles.tolist()
                 break
-        if valid:
-            chosen_angles = angles.tolist()
-            break
-    else:
-        raise RuntimeError("could not find a start/goal angle distribution satisfying drone spacing constraints")
+        else:
+            raise RuntimeError("could not find a start/goal angle distribution satisfying drone spacing constraints")
 
     for i, angle in enumerate(chosen_angles):
         found = False
@@ -993,9 +1053,9 @@ def generate_starts_goals(env: ObstacleEnv,
 
             if np.linalg.norm(np.array(goal) - np.array(start)) < min_sg_dist:
                 continue
-            if not env.is_point_safe(start[0], start[1], start[2]):
+            if not env.is_point_safe(start[0], start[1], start[2], clearance=obstacle_clearance):
                 continue
-            if not env.is_point_safe(goal[0], goal[1], goal[2]):
+            if not env.is_point_safe(goal[0], goal[1], goal[2], clearance=obstacle_clearance):
                 continue
             if any(np.linalg.norm(np.array(start) - np.array(s)) < min_sep for s in starts):
                 continue
@@ -1017,7 +1077,7 @@ def validate_scenario(output: dict, cfg: dict) -> list[str]:
     """Validate exported trajectories against static obstacles and swarm clearance."""
     issues: list[str] = []
     drones = [d for d in output["drones"] if d.get("trajectory") is not None]
-    obstacles = output["obstacles"]
+    obstacles = output.get("obstacles", [])
     drone_radius = cfg["drone_radius"]
     swarm_clearence = cfg["swarm_clearence"]
 
@@ -1033,20 +1093,34 @@ def validate_scenario(output: dict, cfg: dict) -> list[str]:
     for drone in drones:
         pts = np.array(drone["trajectory"]["positions"], dtype=float)
         for obs_idx, obs in enumerate(obstacles):
-            c = math.cos(obs["yaw"])
-            s = math.sin(obs["yaw"])
-            dx = pts[:, 0] - obs["x"]
-            dy = pts[:, 1] - obs["y"]
-            local_x = c * dx + s * dy
-            local_y = -s * dx + c * dy
-            inside_x = np.abs(local_x) < obs["size_x"] / 2.0 + drone_radius
-            inside_y = np.abs(local_y) < obs["size_y"] / 2.0 + drone_radius
-            inside_z = np.abs(pts[:, 2] - obs["z"]) < obs["size_z"] / 2.0 + drone_radius
-            if np.any(inside_x & inside_y & inside_z):
-                issues.append(
-                    f"drone {drone['id']} intersects box obstacle {obs_idx}"
+            if obs.get("type") == "cylinder":
+                base_z = float(obs.get("base_z", obs["z"] - obs["height"] / 2.0))
+                d_xy = np.hypot(pts[:, 0] - obs["x"], pts[:, 1] - obs["y"])
+                inside_xy = d_xy < obs["radius"] + drone_radius
+                inside_z = (
+                    (pts[:, 2] > base_z - drone_radius)
+                    & (pts[:, 2] < base_z + obs["height"] + drone_radius)
                 )
-                break
+                if np.any(inside_xy & inside_z):
+                    issues.append(
+                        f"drone {drone['id']} intersects cylinder obstacle {obs_idx}"
+                    )
+                    break
+            else:
+                c = math.cos(obs["yaw"])
+                s = math.sin(obs["yaw"])
+                dx = pts[:, 0] - obs["x"]
+                dy = pts[:, 1] - obs["y"]
+                local_x = c * dx + s * dy
+                local_y = -s * dx + c * dy
+                inside_x = np.abs(local_x) < obs["size_x"] / 2.0 + drone_radius
+                inside_y = np.abs(local_y) < obs["size_y"] / 2.0 + drone_radius
+                inside_z = np.abs(pts[:, 2] - obs["z"]) < obs["size_z"] / 2.0 + drone_radius
+                if np.any(inside_x & inside_y & inside_z):
+                    issues.append(
+                        f"drone {drone['id']} intersects box obstacle {obs_idx}"
+                    )
+                    break
 
     for i in range(len(drones)):
         ti = np.array(drones[i]["trajectory"]["timestamps"], dtype=float)
@@ -1101,30 +1175,32 @@ def parse_args():
                    help="named obstacle preset for denser/taller scenes")
     p.add_argument("--n-obstacles", type=int,   default=DEFAULT_CONFIG["n_obstacles"],
                    help="number of obstacles")
-    p.add_argument("--obs-width-min",   type=float, default=DEFAULT_CONFIG["obs_width_min"],
-                   help="minimum obstacle box width (m)")
-    p.add_argument("--obs-width-max",   type=float, default=DEFAULT_CONFIG["obs_width_max"],
-                   help="maximum obstacle box width (m)")
-    p.add_argument("--obs-length-min",  type=float, default=DEFAULT_CONFIG["obs_length_min"],
-                   help="minimum obstacle box length (m)")
-    p.add_argument("--obs-length-max",  type=float, default=DEFAULT_CONFIG["obs_length_max"],
-                   help="maximum obstacle box length (m)")
+    p.add_argument("--obs-r-min",   type=float, default=DEFAULT_CONFIG["obs_radius_min"],
+                   help="minimum obstacle cylinder radius (m)")
+    p.add_argument("--obs-r-max",   type=float, default=DEFAULT_CONFIG["obs_radius_max"],
+                   help="maximum obstacle cylinder radius (m)")
     p.add_argument("--obs-h-min",   type=float, default=DEFAULT_CONFIG["obs_height_min"],
                    help="minimum obstacle height (m)")
     p.add_argument("--obs-h-max",   type=float, default=DEFAULT_CONFIG["obs_height_max"],
                    help="maximum obstacle height (m)")
     p.add_argument("--min-obs-spacing", type=float, default=DEFAULT_CONFIG["min_obs_spacing"],
-                   help="minimum edge-to-edge spacing between obstacles (m)")
+                   help="minimum center-to-center spacing between obstacle cylinders (m)")
     p.add_argument("--obs-inner-ratio", type=float, default=DEFAULT_CONFIG["obs_inner_ratio"],
                    help="fraction of the map used for obstacle placement near the center")
+    p.add_argument("--voxel-size", type=float, default=DEFAULT_CONFIG["voxel_size"],
+                   help="occupied voxel size used to approximate cylinders and export the global cloud (m)")
 
     # Paths
     p.add_argument("--safe-margin", type=float, default=DEFAULT_CONFIG["safe_margin"],
                    help="minimum clearance from starts/goals to obstacles (m)")
+    p.add_argument("--start-goal-clearance", type=float, default=DEFAULT_CONFIG["start_goal_clearance"],
+                   help="minimum obstacle clearance for sampled starts/goals, matching the C++ data generator (m)")
     p.add_argument("--min-drone-sep", type=float, default=DEFAULT_CONFIG["min_drone_sep"],
                    help="minimum separation between different drones' starts/goals (m)")
     p.add_argument("--min-sg-dist", type=float, default=DEFAULT_CONFIG["min_sg_dist"],
                    help="minimum straight-line distance between one drone's start and goal (m)")
+    p.add_argument("--periphery-ratio", type=float, default=DEFAULT_CONFIG["periphery_ratio"],
+                   help="outer-ring ratio used when sampling starts/goals")
     p.add_argument("--traj-margin-extra", type=float, default=DEFAULT_CONFIG["traj_margin_extra"],
                    help="extra margin for trajectory collision checking (m)")
     p.add_argument("--swarm-clearence", type=float, default=DEFAULT_CONFIG["swarm_clearence"],
@@ -1165,18 +1241,20 @@ def main():
         "map_x":              args.map_x,
         "map_y":              args.map_y,
         "map_z":              args.map_z,
+        "ground_z":           DEFAULT_CONFIG["ground_z"],
         "n_obstacles":        args.n_obstacles,
-        "obs_width_min":      args.obs_width_min,
-        "obs_width_max":      args.obs_width_max,
-        "obs_length_min":     args.obs_length_min,
-        "obs_length_max":     args.obs_length_max,
+        "obs_radius_min":     args.obs_r_min,
+        "obs_radius_max":     args.obs_r_max,
         "obs_height_min":     args.obs_h_min,
         "obs_height_max":     args.obs_h_max,
         "min_obs_spacing":    args.min_obs_spacing,
         "obs_inner_ratio":    args.obs_inner_ratio,
+        "voxel_size":         args.voxel_size,
         "safe_margin":        args.safe_margin,
+        "start_goal_clearance": args.start_goal_clearance,
         "min_drone_sep":      args.min_drone_sep,
         "min_sg_dist":        args.min_sg_dist,
+        "periphery_ratio":    args.periphery_ratio,
         "traj_margin_extra":  args.traj_margin_extra,
         "swarm_clearence":    args.swarm_clearence,
         "smooth_traj":        args.smooth and not args.no_smooth,
@@ -1201,15 +1279,19 @@ def main():
     print(
         "Obstacle settings: "
         f"count={cfg['n_obstacles']}, "
-        f"width=[{cfg['obs_width_min']:.2f}, {cfg['obs_width_max']:.2f}], "
-        f"length=[{cfg['obs_length_min']:.2f}, {cfg['obs_length_max']:.2f}], "
+        f"radius=[{cfg['obs_radius_min']:.2f}, {cfg['obs_radius_max']:.2f}], "
         f"height=[{cfg['obs_height_min']:.2f}, {cfg['obs_height_max']:.2f}], "
-        f"spacing={cfg['min_obs_spacing']:.2f}, "
-        f"inner_ratio={cfg['obs_inner_ratio']:.2f}"
+        f"center_spacing={cfg['min_obs_spacing']:.2f}, "
+        f"inner_ratio={cfg['obs_inner_ratio']:.2f}, "
+        f"voxel={cfg['voxel_size']:.2f}"
     )
     env = ObstacleEnv(cfg)
     obstacles = env.generate()
-    print(f"Placed {len(obstacles)} static box obstacles")
+    global_cloud_world = env.export_global_cloud(cfg["voxel_size"])
+    print(
+        f"Placed {len(obstacles)} static cylinder obstacles "
+        f"({len(global_cloud_world)} occupied voxels @ {cfg['voxel_size']:.2f} m)"
+    )
 
     # ------------------------------------------------------------------
     # Step 2: Generate starts and goals
@@ -1268,13 +1350,17 @@ def main():
     output = {
         "_comment": (
             "Schema: metadata stores global scenario settings; obstacles is a list of "
-            "boxes {type, x, y, z, size_x, size_y, size_z, yaw}; drones is a list of {id, start, goal, trajectory}. "
+            "analytic cylinders {type, x, y, z, radius, height, base_z}; "
+            "scenario.global_cloud_world stores voxelized obstacle centers that mimic each cylinder using small cubes; "
+            "drones is a list of {id, start, goal, trajectory}. "
             "trajectory stores duration, dt, timestamps, positions, velocities, and accelerations "
             "in world coordinates."
         ),
         "metadata": {
             "n_drones":     cfg["n_drones"],
             "n_obstacles":  len(obstacles),
+            "global_cloud_points": len(global_cloud_world),
+            "obstacle_voxel_size": cfg["voxel_size"],
             "scenario_name": scenario_name,
             "scenario_index": cfg["scenario_index"],
             "dt":           0.01,
@@ -1293,6 +1379,9 @@ def main():
                 "Trajectory sampled at 100Hz. Positions/velocities/accelerations "
                 "are in world frame (NED-compatible, Z-up)."
             ),
+        },
+        "scenario": {
+            "global_cloud_world": global_cloud_world,
         },
         "obstacles": [dict(obs) for obs in obstacles],
         "drones": [],

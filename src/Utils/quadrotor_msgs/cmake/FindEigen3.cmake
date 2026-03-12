@@ -30,7 +30,12 @@ if(NOT Eigen3_FIND_VERSION)
 endif(NOT Eigen3_FIND_VERSION)
 
 macro(_eigen3_check_version)
-  file(READ "${EIGEN3_INCLUDE_DIR}/Eigen/src/Core/util/Macros.h" _eigen3_version_header)
+  # Newer Eigen releases provide version macros in Eigen/Version instead of Macros.h.
+  if(EXISTS "${EIGEN3_INCLUDE_DIR}/Eigen/Version")
+    file(READ "${EIGEN3_INCLUDE_DIR}/Eigen/Version" _eigen3_version_header)
+  else()
+    file(READ "${EIGEN3_INCLUDE_DIR}/Eigen/src/Core/util/Macros.h" _eigen3_version_header)
+  endif()
 
   string(REGEX MATCH "define[ \t]+EIGEN_WORLD_VERSION[ \t]+([0-9]+)" _eigen3_world_version_match "${_eigen3_version_header}")
   set(EIGEN3_WORLD_VERSION "${CMAKE_MATCH_1}")
@@ -39,12 +44,18 @@ macro(_eigen3_check_version)
   string(REGEX MATCH "define[ \t]+EIGEN_MINOR_VERSION[ \t]+([0-9]+)" _eigen3_minor_version_match "${_eigen3_version_header}")
   set(EIGEN3_MINOR_VERSION "${CMAKE_MATCH_1}")
 
-  set(EIGEN3_VERSION ${EIGEN3_WORLD_VERSION}.${EIGEN3_MAJOR_VERSION}.${EIGEN3_MINOR_VERSION})
-  if(${EIGEN3_VERSION} VERSION_LESS ${Eigen3_FIND_VERSION})
+  if(EIGEN3_WORLD_VERSION STREQUAL "" OR EIGEN3_MAJOR_VERSION STREQUAL "" OR EIGEN3_MINOR_VERSION STREQUAL "")
+    set(EIGEN3_VERSION "")
     set(EIGEN3_VERSION_OK FALSE)
-  else(${EIGEN3_VERSION} VERSION_LESS ${Eigen3_FIND_VERSION})
+  else()
+    set(EIGEN3_VERSION "${EIGEN3_WORLD_VERSION}.${EIGEN3_MAJOR_VERSION}.${EIGEN3_MINOR_VERSION}")
+  endif()
+
+  if(EIGEN3_VERSION AND EIGEN3_VERSION VERSION_LESS Eigen3_FIND_VERSION)
+    set(EIGEN3_VERSION_OK FALSE)
+  elseif(EIGEN3_VERSION)
     set(EIGEN3_VERSION_OK TRUE)
-  endif(${EIGEN3_VERSION} VERSION_LESS ${Eigen3_FIND_VERSION})
+  endif()
 
   if(NOT EIGEN3_VERSION_OK)
 
@@ -78,4 +89,3 @@ else (EIGEN3_INCLUDE_DIR)
   mark_as_advanced(EIGEN3_INCLUDE_DIR)
 
 endif(EIGEN3_INCLUDE_DIR)
-
